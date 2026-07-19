@@ -564,6 +564,52 @@ function handleChatPage() {
     .log-event { color: rgba(56, 189, 248, 0.95); font-weight: 600; }
     .log-detail { color: rgba(251, 191, 36, 0.88); margin-left: 8px; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
 
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.45);
+      z-index: 999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      animation: popIn 200ms ease;
+    }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      max-width: 480px;
+      width: 100%;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      backdrop-filter: blur(10px);
+    }
+    .modal h3 {
+      margin: 0;
+      font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+      font-size: 16px;
+      letter-spacing: 0.2px;
+    }
+    .modal .field-label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .modal .hint {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .modal .actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+
     @keyframes popIn {
       from { opacity: 0; transform: translateY(6px); }
       to { opacity: 1; transform: translateY(0); }
@@ -594,6 +640,7 @@ function handleChatPage() {
         <select id="model" class="grow"><option value="qwen3.5-plus">qwen3.5-plus</option></select>
         <button id="refreshModels" class="btn" type="button">刷新模型</button>
         <button id="logToggle" class="log-toggle" type="button">显示日志</button>
+        <button id="settingsBtn" class="btn" type="button">设置</button>
       </div>
     </header>
 
@@ -607,7 +654,6 @@ function handleChatPage() {
 
     <section class="panel video-panel" aria-label="图片生成">
       <div class="video-row">
-        <span class="video-tag" id="imageGenTag">图片生成</span>
         <select id="imageGenMode" style="flex: 0 0 auto; min-width: 120px;">
           <option value="chat">聊天模式</option>
           <option value="image">图片生成</option>
@@ -675,7 +721,8 @@ function handleChatPage() {
       var SHOW_LOGS_KEY = 'qwen2api.chat.showLogs.v1';
       var MODEL_KEY = 'qwen2api.chat.model.v1';
       var LANG_KEY = 'qwen2api.chat.lang.v1';
-      var state = { hist: [], files: [], ac: null, sending: false, showLogs: false, videoUrl: '', modelLoadId: 0, modelLoading: false, preferredModel: '', lastModelAuthKey: null, imageGenMode: 'chat' };
+      var IMAGE_PROXY_KEY = 'qwen2api.chat.imageProxy.v1';
+      var state = { hist: [], files: [], ac: null, sending: false, showLogs: false, videoUrl: '', modelLoadId: 0, modelLoading: false, preferredModel: '', lastModelAuthKey: null, imageGenMode: 'chat', imageProxy: '' };
       var API_BASE = (function () {
         var p = (location && location.pathname) ? location.pathname : '';
         if (p === '/.netlify/functions/api' || p.indexOf('/.netlify/functions/api/') === 0) return '/.netlify/functions/api';
@@ -694,6 +741,7 @@ function handleChatPage() {
         refreshModels: document.getElementById('refreshModels'),
         clear: document.getElementById('clear'),
         logToggle: document.getElementById('logToggle'),
+        settingsBtn: document.getElementById('settingsBtn'),
         logPanel: document.getElementById('logPanel'),
         logs: document.getElementById('logs'),
         clearLogs: document.getElementById('clearLogs'),
@@ -802,6 +850,15 @@ function handleChatPage() {
             ,authFailed: '鉴权失败：Incorrect API key provided.'
             ,payloadTooLarge: '请求体过大，请减小附件。'
             ,serverError: '服务端异常，请稍后重试。'
+            ,settings: '设置'
+            ,imageProxy: '图片代理前缀'
+            ,imageProxyPh: '例如：https://proxy.example.com/?url='
+            ,imageProxyHint: '设置后，图片链接会直接拼接到该代理地址之后。留空则不使用代理。'
+            ,save: '保存'
+            ,cancel: '取消'
+            ,clearProxy: '清除代理'
+            ,imageProxySet: '图片代理已设置。'
+            ,imageProxyCleared: '图片代理已清除。'
           },
           en: {
             brandSub: 'Light · Streaming · Attachments',
@@ -878,6 +935,15 @@ function handleChatPage() {
             ,authFailed: 'Auth failed: Incorrect API key provided.'
             ,payloadTooLarge: 'Request body too large; please reduce attachments.'
             ,serverError: 'Server error; please try again later.'
+            ,settings: 'Settings'
+            ,imageProxy: 'Image proxy prefix'
+            ,imageProxyPh: 'e.g. https://proxy.example.com/?url='
+            ,imageProxyHint: 'When set, image URLs are prepended with this proxy. Leave empty to disable.'
+            ,save: 'Save'
+            ,cancel: 'Cancel'
+            ,clearProxy: 'Clear proxy'
+            ,imageProxySet: 'Image proxy set.'
+            ,imageProxyCleared: 'Image proxy cleared.'
           }
         };
         return (dict[L] && dict[L][key]) || (dict.zh && dict.zh[key]) || key;
@@ -914,6 +980,8 @@ function handleChatPage() {
         if (e.logToggle) {
           e.logToggle.textContent = state.showLogs ? t('hideLogs') : t('showLogs');
         }
+
+        if (e.settingsBtn) e.settingsBtn.textContent = t('settings');
 
         rHist();
       }
@@ -972,6 +1040,8 @@ function handleChatPage() {
           localStorage.setItem(SHOW_LOGS_KEY, state.showLogs ? '1' : '0');
           if (state.preferredModel) localStorage.setItem(MODEL_KEY, state.preferredModel);
           else localStorage.removeItem(MODEL_KEY);
+          if (state.imageProxy) localStorage.setItem(IMAGE_PROXY_KEY, state.imageProxy);
+          else localStorage.removeItem(IMAGE_PROXY_KEY);
         } catch (_) {}
       }
       function load() {
@@ -1011,6 +1081,10 @@ function handleChatPage() {
         try {
           var savedLang = localStorage.getItem(LANG_KEY);
           if (savedLang) state.lang = String(savedLang || '').toLowerCase();
+        } catch (_) {}
+        try {
+          var savedImageProxy = localStorage.getItem(IMAGE_PROXY_KEY);
+          if (savedImageProxy) state.imageProxy = String(savedImageProxy);
         } catch (_) {}
       }
       function summarizeMessageContent(content) {
@@ -1101,7 +1175,8 @@ function handleChatPage() {
               imageContainer.innerHTML = '';
               for (var i = 0; i < imageUrls.length; i++) {
                 var img = document.createElement('img');
-                img.src = imageUrls[i];
+                var rawUrl = imageUrls[i];
+                img.src = state.imageProxy ? (state.imageProxy + rawUrl) : rawUrl;
                 img.style.maxWidth = '100%';
                 img.style.maxHeight = '400px';
                 img.style.borderRadius = '8px';
@@ -1532,6 +1607,13 @@ function handleChatPage() {
           return;
         }
 
+        // 重发时先清掉该消息及其之后的所有消息（对话流和图片生成流通用）
+        if (typeof replayFromIndex === 'number' && replayFromIndex >= 0) {
+          state.hist = state.hist.slice(0, replayFromIndex);
+          save();
+          rHist();
+        }
+
         var text = '';
         var filesForSend = fromResend ? [] : state.files;
         var userMessageContent;
@@ -1800,6 +1882,112 @@ function handleChatPage() {
         }
       }
 
+      function openSettingsDialog() {
+        if (state.settingsDialog) return;
+
+        var backdrop = document.createElement('div');
+        backdrop.className = 'modal-backdrop';
+
+        function close() {
+          document.removeEventListener('keydown', escListener);
+          if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+          state.settingsDialog = null;
+        }
+        function escListener(ev) {
+          if (ev.key === 'Escape') {
+            ev.preventDefault();
+            close();
+          }
+        }
+
+        var dialog = document.createElement('div');
+        dialog.className = 'modal';
+
+        var title = document.createElement('h3');
+        title.textContent = t('settings');
+
+        var label = document.createElement('div');
+        label.className = 'field-label';
+        label.textContent = t('imageProxy');
+
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.id = 'imageProxyInput';
+        input.placeholder = t('imageProxyPh');
+        input.value = state.imageProxy || '';
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        input.style.width = '100%';
+
+        var hint = document.createElement('div');
+        hint.className = 'hint';
+        hint.textContent = t('imageProxyHint');
+
+        var actions = document.createElement('div');
+        actions.className = 'actions';
+
+        var clearBtn = document.createElement('button');
+        clearBtn.type = 'button';
+        clearBtn.className = 'warn';
+        clearBtn.textContent = t('clearProxy');
+        clearBtn.onclick = function () {
+          state.imageProxy = '';
+          save();
+          close();
+          st(t('imageProxyCleared'), 'ok');
+          if (!state.sending) rHist();
+        };
+
+        var cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'btn';
+        cancelBtn.textContent = t('cancel');
+        cancelBtn.onclick = close;
+
+        var saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.className = 'primary';
+        saveBtn.textContent = t('save');
+        saveBtn.onclick = function () {
+          var v = (input.value || '').trim();
+          state.imageProxy = v;
+          save();
+          close();
+          st(v ? t('imageProxySet') : t('imageProxyCleared'), 'ok');
+          if (!state.sending) rHist();
+        };
+
+        input.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' && !ev.isComposing) {
+            ev.preventDefault();
+            saveBtn.click();
+          }
+        });
+
+        actions.appendChild(clearBtn);
+        actions.appendChild(cancelBtn);
+        actions.appendChild(saveBtn);
+
+        dialog.appendChild(title);
+        dialog.appendChild(label);
+        dialog.appendChild(input);
+        dialog.appendChild(hint);
+        dialog.appendChild(actions);
+
+        backdrop.appendChild(dialog);
+
+        backdrop.addEventListener('click', function (ev) {
+          if (ev.target === backdrop) close();
+        });
+
+        document.addEventListener('keydown', escListener);
+
+        document.body.appendChild(backdrop);
+        state.settingsDialog = backdrop;
+
+        setTimeout(function () { input.focus(); input.select(); }, 50);
+      }
+
       // events
       if (e.langToggle) {
         e.langToggle.onclick = function () {
@@ -1810,6 +1998,9 @@ function handleChatPage() {
         setLogPanelVisible(!state.showLogs);
         save();
       };
+      if (e.settingsBtn) {
+        e.settingsBtn.onclick = function () { openSettingsDialog(); };
+      }
       e.clearLogs.onclick = function () {
         if (state.sending || state.modelLoading) {
           st(state.sending ? t('logsClearBusy') : t('logsClearBusyModels'), 'err');
