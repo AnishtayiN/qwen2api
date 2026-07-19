@@ -1139,16 +1139,21 @@ async function handleImageGenerations(body, authHeader, env) {
   });
   const createParsed = await safeReadJson(createResp);
   if (!createParsed.ok) {
+    const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
+    console.log(`[qwen2api][image] Create chat session failed: HTTP ${createResp.status}, body: ${preview}`);
+    const wafMatch = preview.match(/aliyun_waf/i);
+    const msg = wafMatch
+      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
+      : `Failed to create image chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
     return createResponse({
-      error: {
-        message: `Failed to create image chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`,
-        type: 'api_error',
-      },
+      error: { message: msg, type: 'api_error' },
     }, createResp.ok ? 502 : createResp.status);
   }
   const createData = createParsed.data;
   if (!createData?.success || !createData?.data?.id) {
-    return createResponse({ error: { message: 'Failed to create image chat session', type: 'api_error' } }, 500);
+    const errMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || 'Failed to create image chat session';
+    console.log(`[qwen2api][image] Create chat session error: ${JSON.stringify(createData?.data || createData)}`);
+    return createResponse({ error: { message: errMsg, type: 'api_error' } }, 500);
   }
   const chatId = createData.data.id;
 
@@ -1207,27 +1212,30 @@ async function handleImageGenerations(body, authHeader, env) {
     }),
   });
 
+  const rawText = await chatResp.text().catch(() => '');
   if (!chatResp.ok) {
-    const errorText = await chatResp.text().catch(() => '');
-    return createResponse({ error: { message: errorText || `HTTP ${chatResp.status}`, type: 'api_error' } }, chatResp.status);
+    return createResponse({ error: { message: rawText || `HTTP ${chatResp.status}`, type: 'api_error' } }, chatResp.status);
   }
 
-  const reader = chatResp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  const firstChar = rawText.trimStart().charAt(0);
+  if (firstChar === '{' || firstChar === '[') {
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch {}
+    if (parsed && parsed.success === false) {
+      const errData = parsed.data || parsed;
+      const msg = errData.details || errData.message || errData.code || 'Upstream request failed';
+      return createResponse({ error: { message: msg, type: 'api_error', code: errData.code } }, 502);
+    }
   }
-  const urls = extractImageUrlsFromUpstreamSse(buffer);
+
+  const urls = extractImageUrlsFromUpstreamSse(rawText);
   if (!urls || urls.length === 0) {
-    const upstreamError = extractUpstreamErrorFromSse(buffer);
+    const upstreamError = extractUpstreamErrorFromSse(rawText);
     if (upstreamError) {
       return createResponse({ error: { message: upstreamError.message, type: 'api_error', code: upstreamError.code } }, 502);
     }
     console.log('[qwen2api][image] Upstream SSE response with no image URLs:');
-    console.log(buffer.slice(0, 2000));
+    console.log(rawText.slice(0, 2000));
     return createResponse({ error: { message: 'Upstream returned no image URLs', type: 'api_error' } }, 502);
   }
 
