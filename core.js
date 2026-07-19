@@ -1314,27 +1314,21 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   });
   const createParsed = await safeReadJson(createResp);
   if (!createParsed.ok) {
-    logChatDetail('core', 'chat.create.parse.error', {
-      status: createResp.status,
-      contentType: createResp.headers.get('content-type') || '',
-      bodyPreview: previewBody(createParsed.rawText),
-      parseError: createParsed.parseError?.message || '',
-    });
+    const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
+    console.log(`[qwen2api][chat] Create chat session failed: HTTP ${createResp.status}, body: ${preview}`);
+    const wafMatch = preview.match(/aliyun_waf/i);
+    const msg = wafMatch
+      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
+      : `Failed to create chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
     return createResponse({
-      error: {
-        message: `Failed to create chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`,
-        type: 'api_error'
-      }
+      error: { message: msg, type: 'api_error' }
     }, createResp.ok ? 502 : createResp.status);
   }
   const createData = createParsed.data;
-  logChatDetail('core', 'chat.create.response', {
-    status: createResp.status,
-    success: !!createData?.success,
-    hasChatId: !!createData?.data?.id,
-  });
   if (!createData.success || !createData.data?.id) {
-    return createResponse({ error: { message: 'Failed to create chat session', type: 'api_error' } }, 500);
+    const errMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || 'Failed to create chat session';
+    console.log(`[qwen2api][chat] Create chat session error: ${JSON.stringify(createData?.data || createData)}`);
+    return createResponse({ error: { message: errMsg, type: 'api_error' } }, 500);
   }
   const chatId = createData.data.id;
 
@@ -1378,8 +1372,16 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
 
   if (!chatResp.ok) {
     const errorText = await chatResp.text().catch(() => '');
-    logChatDetail('core', 'chat.completion.error', { status: chatResp.status, chatId, error: errorText });
-    return createResponse({ error: { message: errorText || `HTTP ${chatResp.status}`, type: 'api_error' } }, chatResp.status);
+    console.log(`[qwen2api][chat] Completion error: HTTP ${chatResp.status}, body: ${errorText.slice(0, 500)}`);
+    let errMsg = errorText || `HTTP ${chatResp.status}`;
+    try {
+      const errJson = JSON.parse(errorText);
+      if (errJson?.data?.details) errMsg = errJson.data.details;
+      else if (errJson?.data?.message) errMsg = errJson.data.message;
+      else if (errJson?.data?.code) errMsg = errJson.data.code;
+      else if (errJson?.error?.message) errMsg = errJson.error.message;
+    } catch {}
+    return createResponse({ error: { message: errMsg, type: 'api_error' } }, chatResp.status);
   }
   logChatDetail('core', 'chat.completion.started', { status: chatResp.status, chatId, stream: !!stream });
 
