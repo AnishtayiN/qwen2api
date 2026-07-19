@@ -508,6 +508,24 @@ function extractImageUrlsFromUpstreamSse(rawPayload) {
   return out;
 }
 
+function extractUpstreamErrorFromSse(rawPayload) {
+  const payload = typeof rawPayload === 'string' ? rawPayload : '';
+  for (const line of payload.split('\n')) {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data);
+      const err = parsed?.error;
+      if (err && err.code === 'data_inspection_failed') {
+        return { message: err.details || err.message || '内容安全警告', code: err.code };
+      }
+    } catch {}
+  }
+  return null;
+}
+
 async function fetchImageAsBase64(url) {
   const resp = await fetch(url);
   if (!resp.ok) {
@@ -1204,6 +1222,12 @@ async function handleImageGenerations(body, authHeader, env) {
   }
   const urls = extractImageUrlsFromUpstreamSse(buffer);
   if (!urls || urls.length === 0) {
+    const upstreamError = extractUpstreamErrorFromSse(buffer);
+    if (upstreamError) {
+      return createResponse({ error: { message: upstreamError.message, type: 'api_error', code: upstreamError.code } }, 502);
+    }
+    console.log('[qwen2api][image] Upstream SSE response with no image URLs:');
+    console.log(buffer.slice(0, 2000));
     return createResponse({ error: { message: 'Upstream returned no image URLs', type: 'api_error' } }, 502);
   }
 
