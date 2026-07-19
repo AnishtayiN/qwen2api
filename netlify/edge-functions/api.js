@@ -180,6 +180,37 @@ function extractImageUrlsFromUpstreamSse(rawPayload) {
   return out;
 }
 
+async function safeReadJson(response) {
+  const status = response?.status;
+  const rawText = await response.text().catch(() => '');
+  if (!rawText) {
+    return { ok: false, status, data: null, rawText: '', parseError: new Error('Empty response body') };
+  }
+  try {
+    return { ok: true, status, data: JSON.parse(rawText), rawText, parseError: null };
+  } catch (parseError) {
+    return { ok: false, status, data: null, rawText, parseError };
+  }
+}
+
+function extractUpstreamErrorFromSse(rawPayload) {
+  const payload = typeof rawPayload === 'string' ? rawPayload : '';
+  for (const line of payload.split('\n')) {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data);
+      const err = parsed?.error;
+      if (err && err.code === 'data_inspection_failed') {
+        return { message: err.details || err.message || '内容安全警告', code: err.code };
+      }
+    } catch {}
+  }
+  return null;
+}
+
 function bytesToBase64(bytes) {
   let out = '';
   let chunk = '';
@@ -2864,14 +2895,27 @@ async function handleChatCompletions(body, authHeader, env) {
       timestamp: Date.now(), project_id: ''
     })
   });
-  const createData = await createResp.json();
+  const createParsed = await safeReadJson(createResp);
   logChatDetail('netlify-edge', 'chat.create.response', {
     status: createResp.status,
-    success: !!createData?.success,
-    hasChatId: !!createData?.data?.id,
+    parseOk: createParsed.ok,
+    success: !!createParsed.data?.success,
+    hasChatId: !!createParsed.data?.data?.id,
   });
-  if (!createData.success || !createData.data?.id) {
-    return jsonResponse({ error: { message: 'Failed to create chat session', type: 'api_error', details: createData } }, 500);
+  if (!createParsed.ok) {
+    const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
+    console.log(`[qwen2api][netlify][chat] Create chat session failed: HTTP ${createResp.status}, body: ${preview}`);
+    const wafMatch = preview.match(/aliyun_waf/i);
+    const msg = wafMatch
+      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
+      : `Failed to create chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
+    return jsonResponse({ error: { message: msg, type: 'api_error' } }, createResp.ok ? 502 : createResp.status);
+  }
+  const createData = createParsed.data;
+  if (!createData?.success || !createData?.data?.id) {
+    const errMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || 'Failed to create chat session';
+    console.log(`[qwen2api][netlify][chat] Create chat session error: ${JSON.stringify(createData?.data || createData)}`);
+    return jsonResponse({ error: { message: errMsg, type: 'api_error' } }, 500);
   }
   const chatId = createData.data.id;
 
@@ -2908,8 +2952,18 @@ async function handleChatCompletions(body, authHeader, env) {
   });
 
   if (!chatResp.ok) {
+    const errorText = await chatResp.text().catch(() => '');
     logChatDetail('netlify-edge', 'chat.completion.error', { status: chatResp.status, chatId });
-    return jsonResponse({ error: { message: await chatResp.text(), type: 'api_error' } }, chatResp.status);
+    console.log(`[qwen2api][netlify][chat] Completion error: HTTP ${chatResp.status}, body: ${errorText.slice(0, 500)}`);
+    let errMsg = errorText || `HTTP ${chatResp.status}`;
+    try {
+      const errJson = JSON.parse(errorText);
+      if (errJson?.data?.details) errMsg = errJson.data.details;
+      else if (errJson?.data?.message) errMsg = errJson.data.message;
+      else if (errJson?.data?.code) errMsg = errJson.data.code;
+      else if (errJson?.error?.message) errMsg = errJson.error.message;
+    } catch {}
+    return jsonResponse({ error: { message: errMsg, type: 'api_error' } }, chatResp.status);
   }
   logChatDetail('netlify-edge', 'chat.completion.started', { status: chatResp.status, chatId, stream: !!stream });
 
@@ -3083,9 +3137,21 @@ async function handleImageGenerations(body, authHeader, env) {
     },
     body: JSON.stringify({ title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: 't2i', timestamp: Date.now(), project_id: '' }),
   });
-  const createData = await createResp.json().catch(() => ({}));
-  if (!createResp.ok || !createData?.success || !createData?.data?.id) {
-    return jsonResponse({ error: { message: 'Failed to create image chat session', type: 'api_error', details: createData } }, 500);
+  const createParsed = await safeReadJson(createResp);
+  if (!createParsed.ok) {
+    const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
+    console.log(`[qwen2api][netlify][image] Create chat session failed: HTTP ${createResp.status}, body: ${preview}`);
+    const wafMatch = preview.match(/aliyun_waf/i);
+    const msg = wafMatch
+      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
+      : `Failed to create image chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
+    return jsonResponse({ error: { message: msg, type: 'api_error' } }, createResp.ok ? 502 : createResp.status);
+  }
+  const createData = createParsed.data;
+  if (!createData?.success || !createData?.data?.id) {
+    const errMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || 'Failed to create image chat session';
+    console.log(`[qwen2api][netlify][image] Create chat session error: ${JSON.stringify(createData?.data || createData)}`);
+    return jsonResponse({ error: { message: errMsg, type: 'api_error' } }, 500);
   }
   const chatId = createData.data.id;
 
@@ -3111,20 +3177,30 @@ async function handleImageGenerations(body, authHeader, env) {
     }),
   });
 
+  const rawText = await chatResp.text().catch(() => '');
   if (!chatResp.ok) {
-    return jsonResponse({ error: { message: await chatResp.text().catch(() => ''), type: 'api_error' } }, chatResp.status);
+    return jsonResponse({ error: { message: rawText || `HTTP ${chatResp.status}`, type: 'api_error' } }, chatResp.status);
   }
 
-  const reader = chatResp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  const firstChar = rawText.trimStart().charAt(0);
+  if (firstChar === '{' || firstChar === '[') {
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch {}
+    if (parsed && parsed.success === false) {
+      const errData = parsed.data || parsed;
+      const msg = errData.details || errData.message || errData.code || 'Upstream request failed';
+      return jsonResponse({ error: { message: msg, type: 'api_error', code: errData.code } }, 502);
+    }
   }
-  const urls = extractImageUrlsFromUpstreamSse(buffer);
+
+  const urls = extractImageUrlsFromUpstreamSse(rawText);
   if (!urls || urls.length === 0) {
+    const upstreamError = extractUpstreamErrorFromSse(rawText);
+    if (upstreamError) {
+      return jsonResponse({ error: { message: upstreamError.message, type: 'api_error', code: upstreamError.code } }, 502);
+    }
+    console.log('[qwen2api][netlify][image] Upstream SSE response with no image URLs:');
+    console.log(rawText.slice(0, 2000));
     return jsonResponse({ error: { message: 'Upstream returned no image URLs', type: 'api_error' } }, 502);
   }
 
