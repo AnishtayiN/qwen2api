@@ -2840,16 +2840,100 @@ function validateToken(authHeader) {
 // API Handlers
 // ============================================
 
+// Upstream `/api/models` is behind a WAF and now returns an HTML block page
+// instead of JSON. The web app ships the model list inside the homepage HTML
+// as `window.__prerendered_data`, so we scrape that instead. The WAF also
+// rejects short User-Agent strings, so a complete Chrome UA is required.
+const MODELS_BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
+const MODELS_SEC_CH_UA = '"Chromium";v="143", "Not(A:Brand";v="24", "Google Chrome";v="143"';
+const MODELS_CACHE_TTL = 10 * 60 * 1000;
+let modelsCache = null;
+let modelsCacheTime = 0;
+
+// Extracts the balanced JSON object that follows `window.__prerendered_data`.
+function extractPrerenderedData(html) {
+  const marker = html.indexOf('window.__prerendered_data');
+  if (marker < 0) return null;
+  const start = html.indexOf('{', marker);
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < html.length; i++) {
+    const ch = html[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(html.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchQwenModels() {
+  const resp = await fetch('https://chat.qwen.ai/', {
+    headers: {
+      'User-Agent': MODELS_BROWSER_UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Upgrade-Insecure-Requests': '1',
+      'sec-ch-ua': MODELS_SEC_CH_UA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+    },
+  });
+  if (!resp.ok) throw new Error(`models page returned HTTP ${resp.status}`);
+  const html = await resp.text();
+  const data = extractPrerenderedData(html);
+  const models = Array.isArray(data?.models) ? data.models : null;
+  if (!models || models.length === 0) throw new Error('no models found in page');
+  const ids = [];
+  for (const m of models) {
+    const id = typeof m?.id === 'string' ? m.id : (typeof m?.info?.id === 'string' ? m.info.id : '');
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  if (ids.length === 0) throw new Error('no model ids found in page');
+  return ids;
+}
+
+async function getQwenModels() {
+  const now = Date.now();
+  if (modelsCache && now - modelsCacheTime < MODELS_CACHE_TTL) {
+    return modelsCache;
+  }
+  const ids = await fetchQwenModels();
+  modelsCache = ids;
+  modelsCacheTime = now;
+  return ids;
+}
+
 async function handleModels(authHeader) {
   if (!validateToken(authHeader)) {
     return jsonResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
   }
   try {
-    const resp = await fetch('https://chat.qwen.ai/api/models', {
-      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+    const ids = await getQwenModels();
+    const created = Math.floor(Date.now() / 1000);
+    return jsonResponse({
+      object: 'list',
+      data: ids.map((id) => ({ id, object: 'model', created, owned_by: 'qwen' })),
     });
-    return jsonResponse(await resp.json());
-  } catch {
+  } catch (err) {
+    logChatDetail('vercel-edge', 'models.fetch.failed', { message: err?.message || String(err) });
     return jsonResponse({ error: { message: 'Failed to fetch models', type: 'api_error' } }, 500);
   }
 }
