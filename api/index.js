@@ -3202,13 +3202,17 @@ async function handleChatCompletions(body, authHeader) {
             }
           }
         }
-        if (!anyChunkWritten && nonDataBuffer) {
+        if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
+          nonDataBuffer += buffer;
+        }
+        if (!doneWritten && !anyChunkWritten) {
           const upstreamErr = tryParseUpstreamErrorPayload(nonDataBuffer);
           if (upstreamErr) {
             logChatDetail('vercel-edge', 'chat.completion.error', { message: upstreamErr.message });
             await writer.write(encoder.encode(`data: ${JSON.stringify({ error: upstreamErr })}\n\n`));
             doneWritten = true;
           }
+          await writer.write(encoder.encode('data: [DONE]\n\n'));
         }
       } catch (err) {
         const message = err && err.message ? err.message : 'stream proxy error';

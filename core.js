@@ -2084,7 +2084,8 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
     hasChatId: !!createData?.data?.id,
   });
   if (!createResp.ok || !createData.success || !createData.data?.id) {
-    const errorMsg = createData?.message || createData?.msg || createData?.error || `HTTP ${createResp.status}`;
+    const parsedErr = tryParseUpstreamErrorPayload(createParsed.rawText);
+    const errorMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || parsedErr?.message || `HTTP ${createResp.status}`;
     logChatDetail('core', 'chat.create.error', { status: createResp.status, error: errorMsg });
     sendLog('chat.create.failed', { status: createResp.status, error: errorMsg, response: createData });
     return createResponse({ error: { message: `Failed to create chat session: ${errorMsg}`, type: 'api_error' } }, createResp.ok ? 500 : createResp.status);
