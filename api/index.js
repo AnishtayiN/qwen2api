@@ -700,7 +700,7 @@ function handleChatPage() {
       <div class="controls">
         <button id="langToggle" class="btn" type="button" aria-label="Language">EN</button>
         <input id="apiKey" class="grow" type="text" placeholder="API Key（可选）" autocomplete="off" spellcheck="false" />
-        <select id="model" class="grow"><option value="qwen3.5-plus">qwen3.5-plus</option></select>
+        <select id="model" class="grow"><option value="qwen3.8-max">qwen3.8-max</option></select>
         <button id="refreshModels" class="btn" type="button">刷新模型</button>
         <button id="logToggle" class="log-toggle" type="button">显示日志</button>
         <button id="settingsBtn" class="btn" type="button">设置</button>
@@ -1588,7 +1588,7 @@ function handleChatPage() {
           var latestSelected = (e.model.value || '').trim();
           var arr = Array.isArray(data && data.data) ? data.data : [];
           var ids = arr.map(function (x) { return x && x.id; }).filter(Boolean);
-          if (ids.length === 0) ids = ['qwen3.5-plus'];
+          if (ids.length === 0) ids = ['qwen3.8-max'];
           e.model.innerHTML = '';
           for (var i = 0; i < ids.length; i++) {
             var op = document.createElement('option');
@@ -1609,8 +1609,8 @@ function handleChatPage() {
           st(tf('modelsUpdated', { n: ids.length }), 'ok');
         } catch (err) {
           if (reqId !== state.modelLoadId) return;
-          e.model.innerHTML = '<option value="qwen3.5-plus">qwen3.5-plus</option>';
-          e.model.value = 'qwen3.5-plus';
+          e.model.innerHTML = '<option value="qwen3.8-max">qwen3.8-max</option>';
+          e.model.value = 'qwen3.8-max';
           state.lastModelAuthKey = authKey;
           state.preferredModel = e.model.value;
           save();
@@ -1691,7 +1691,7 @@ function handleChatPage() {
           }
         }
 
-        var model = (e.model.value || '').trim() || 'qwen3.5-plus';
+        var model = (e.model.value || '').trim() || 'qwen3.8-max';
         var key = (e.apiKey.value || '').trim();
         
         var imageGenMode = e.imageGenMode.value;
@@ -1769,7 +1769,7 @@ function handleChatPage() {
           return;
         }
 
-        var model = (e.model.value || '').trim() || 'qwen3.5-plus';
+        var model = (e.model.value || '').trim() || 'qwen3.8-max';
         var key = (e.apiKey.value || '').trim();
 
         var videoUrl = (e.videoUrl.value || '').trim();
@@ -2885,6 +2885,17 @@ function validateToken(authHeader) {
 const MODELS_BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
 const MODELS_SEC_CH_UA = '"Chromium";v="143", "Not(A:Brand";v="24", "Google Chrome";v="143"';
 const MODELS_CACHE_TTL = 10 * 60 * 1000;
+
+// Fallback list used when the upstream homepage cannot be scraped (e.g. Vercel
+// egress IP gets WAF-blocked and returns a challenge page). These mirror the
+// models currently exposed by https://chat.qwen.ai/ so the API keeps working.
+const FALLBACK_MODELS = [
+  'qwen3.8-max',
+  'qwen3.7-plus',
+  'qwen3.7-max',
+];
+const DEFAULT_MODEL = FALLBACK_MODELS[0];
+
 let modelsCache = null;
 let modelsCacheTime = 0;
 
@@ -2953,7 +2964,14 @@ async function getQwenModels() {
   if (modelsCache && now - modelsCacheTime < MODELS_CACHE_TTL) {
     return modelsCache;
   }
-  const ids = await fetchQwenModels();
+  let ids;
+  try {
+    ids = await fetchQwenModels();
+  } catch (err) {
+    logChatDetail('vercel-edge', 'models.fetch.failed', { message: err?.message || String(err) });
+    ids = FALLBACK_MODELS.slice();
+  }
+  if (!ids || ids.length === 0) ids = FALLBACK_MODELS.slice();
   modelsCache = ids;
   modelsCacheTime = now;
   return ids;
@@ -2995,11 +3013,11 @@ async function handleChatCompletions(body, authHeader) {
   }
   logChatDetail('vercel-edge', 'request.received', {
     stream: !!stream,
-    model: model || 'qwen3.5-plus',
+    model: model || 'qwen3.8-max',
     messageCount: Array.isArray(messages) ? messages.length : 0,
   });
 
-  const actualModel = model || 'qwen3.5-plus';
+  const actualModel = model || 'qwen3.8-max';
   const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
 
   // 检查是否启用搜索
@@ -3251,7 +3269,7 @@ async function handleImageGenerations(body, authHeader) {
     return jsonResponse({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400);
   }
 
-  const actualModel = normalizeInputString(body?.model) || 'qwen3.5-plus';
+  const actualModel = normalizeInputString(body?.model) || 'qwen3.8-max';
   const nRaw = body?.n;
   let n = Number.isFinite(nRaw) ? Number(nRaw) : Number.parseInt(String(nRaw || ''), 10);
   if (!Number.isFinite(n) || n <= 0) n = 1;
@@ -3395,7 +3413,7 @@ async function handleChatCompletionsWithLogs(body, authHeader) {
       const logEvent = {
         event: 'request.received',
         timestamp: Date.now(),
-        model: body?.model || 'qwen3.5-plus',
+        model: body?.model || 'qwen3.8-max',
         messageCount: Array.isArray(body?.messages) ? body.messages.length : 0,
         chatType: body?.chat_type || 't2t',
         enableSearch: !!body?.enable_search,
