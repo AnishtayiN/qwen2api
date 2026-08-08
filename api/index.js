@@ -201,8 +201,6 @@ function extractUpstreamErrorFromSse(rawPayload) {
       }
     } catch {}
   }
-    } catch {}
-  }
   return null;
 }
 
