@@ -211,6 +211,44 @@ function tryParseRatioString(size) {
   return `${w}:${h}`;
 }
 
+function tryParseUpstreamErrorPayload(rawText) {
+  const text = typeof rawText === 'string' ? rawText : '';
+  const firstChar = text.trimStart().charAt(0);
+  if (firstChar !== '{' && firstChar !== '[') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  if (Array.isArray(parsed.ret)) {
+    const parts = parsed.ret.filter(p => typeof p === 'string' && p);
+    if (parts.length > 0) {
+      const code = parts[0];
+      const message = parts.slice(1).filter(Boolean).join(' | ') || code;
+      return { message, code, type: 'api_error' };
+    }
+  }
+
+  if (parsed.success === false) {
+    const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : {};
+    const message = data.details || data.message || data.msg || data.code || 'Upstream request failed';
+    return { message, code: data.code, type: 'api_error' };
+  }
+
+  if (parsed.error && typeof parsed.error === 'object') {
+    return {
+      message: parsed.error.message || 'Upstream request failed',
+      code: parsed.error.code,
+      type: parsed.error.type || 'api_error',
+    };
+  }
+
+  return null;
+}
+
 function normalizeReasoningFragments(value) {
   if (typeof value === 'string') {
     const text = normalizeReasoningString(value);
@@ -905,8 +943,11 @@ async function handleChatCompletions(body, authHeader, env) {
   });
 
   if (!chatResp.ok) {
+    const errorText = await chatResp.text();
     logChatDetail('cloudflare-worker', 'chat.completion.error', { status: chatResp.status, chatId });
-    return jsonResponse({ error: { message: await chatResp.text(), type: 'api_error' } }, chatResp.status);
+    const parsedErr = tryParseUpstreamErrorPayload(errorText);
+    const errMsg = parsedErr?.message || errorText || `HTTP ${chatResp.status}`;
+    return jsonResponse({ error: { message: errMsg, type: 'api_error', ...(parsedErr?.code ? { code: parsedErr.code } : {}) } }, chatResp.status);
   }
   logChatDetail('cloudflare-worker', 'chat.completion.started', { status: chatResp.status, chatId, stream: !!stream });
 
@@ -925,6 +966,8 @@ async function handleChatCompletions(body, authHeader, env) {
       const decoder = new TextDecoder();
       let buffer = '';
       let doneWritten = false;
+      let anyChunkWritten = false;
+      let nonDataBuffer = '';
 
       try {
         while (true) {
@@ -937,7 +980,10 @@ async function handleChatCompletions(body, authHeader, env) {
 
           for (const line of lines) {
             const trimmed = line.trimStart();
-            if (!trimmed.startsWith('data:')) continue;
+            if (!trimmed.startsWith('data:')) {
+              nonDataBuffer += line + '\n';
+              continue;
+            }
             const data = trimmed.slice(5).trim();
             if (data === '[DONE]') {
               await writer.write(encoder.encode('data: [DONE]\n\n'));
@@ -964,6 +1010,7 @@ async function handleChatCompletions(body, authHeader, env) {
                     }],
                   };
                   await writer.write(encoder.encode(`data: ${JSON.stringify(warningChunk)}\n\n`));
+                  anyChunkWritten = true;
                   doneWritten = true;
                   await writer.write(encoder.encode('data: [DONE]\n\n'));
                   continue;
@@ -976,6 +1023,7 @@ async function handleChatCompletions(body, authHeader, env) {
                   }
                 };
                 await writer.write(encoder.encode(`data: ${JSON.stringify(errObj)}\n\n`));
+                anyChunkWritten = true;
                 continue;
               }
               const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
@@ -992,12 +1040,24 @@ async function handleChatCompletions(body, authHeader, env) {
                   }]
                 };
                 await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                anyChunkWritten = true;
               }
             } catch (streamParseError) {
               void streamParseError;
             }
           }
         }
+          if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
+            nonDataBuffer += buffer;
+          }
+          if (!doneWritten && !anyChunkWritten) {
+            const upstreamErr = tryParseUpstreamErrorPayload(nonDataBuffer);
+            if (upstreamErr) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ error: upstreamErr })}\n\n`));
+              await writer.write(encoder.encode('data: [DONE]\n\n'));
+              doneWritten = true;
+            }
+          }
       } catch (err) {
         const message = err && err.message ? err.message : 'stream proxy error';
         await writer.write(encoder.encode(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`));
@@ -1028,6 +1088,11 @@ async function handleChatCompletions(body, authHeader, env) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
+  }
+  const upstreamErr = tryParseUpstreamErrorPayload(buffer);
+  if (upstreamErr) {
+    logChatDetail('cloudflare-worker', 'chat.completion.error', { message: upstreamErr.message });
+    return jsonResponse({ error: upstreamErr }, 502);
   }
   const parsedSse = parseQwenSsePayload(buffer);
   logChatDetail('cloudflare-worker', 'chat.completion.collected', {

@@ -526,6 +526,44 @@ function extractUpstreamErrorFromSse(rawPayload) {
   return null;
 }
 
+function tryParseUpstreamErrorPayload(rawText) {
+  const text = typeof rawText === 'string' ? rawText : '';
+  const firstChar = text.trimStart().charAt(0);
+  if (firstChar !== '{' && firstChar !== '[') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  if (Array.isArray(parsed.ret)) {
+    const parts = parsed.ret.filter(p => typeof p === 'string' && p);
+    if (parts.length > 0) {
+      const code = parts[0];
+      const message = parts.slice(1).filter(Boolean).join(' | ') || code;
+      return { message, code, type: 'api_error' };
+    }
+  }
+
+  if (parsed.success === false) {
+    const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : {};
+    const message = data.details || data.message || data.msg || data.code || 'Upstream request failed';
+    return { message, code: data.code, type: 'api_error' };
+  }
+
+  if (parsed.error && typeof parsed.error === 'object') {
+    return {
+      message: parsed.error.message || 'Upstream request failed',
+      code: parsed.error.code,
+      type: parsed.error.type || 'api_error',
+    };
+  }
+
+  return null;
+}
+
 async function fetchImageAsBase64(url) {
   const resp = await fetch(url);
   if (!resp.ok) {
@@ -1457,15 +1495,9 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   if (!chatResp.ok) {
     const errorText = await chatResp.text().catch(() => '');
     console.log(`[qwen2api][chat] Completion error: HTTP ${chatResp.status}, body: ${errorText.slice(0, 500)}`);
-    let errMsg = errorText || `HTTP ${chatResp.status}`;
-    try {
-      const errJson = JSON.parse(errorText);
-      if (errJson?.data?.details) errMsg = errJson.data.details;
-      else if (errJson?.data?.message) errMsg = errJson.data.message;
-      else if (errJson?.data?.code) errMsg = errJson.data.code;
-      else if (errJson?.error?.message) errMsg = errJson.error.message;
-    } catch {}
-    return createResponse({ error: { message: errMsg, type: 'api_error' } }, chatResp.status);
+    const parsedErr = tryParseUpstreamErrorPayload(errorText);
+    const errMsg = parsedErr?.message || errorText || `HTTP ${chatResp.status}`;
+    return createResponse({ error: { message: errMsg, type: 'api_error', ...(parsedErr?.code ? { code: parsedErr.code } : {}) } }, chatResp.status);
   }
   logChatDetail('core', 'chat.completion.started', { status: chatResp.status, chatId, stream: !!stream });
 
@@ -1486,6 +1518,11 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
+  }
+  const upstreamErr = tryParseUpstreamErrorPayload(buffer);
+  if (upstreamErr) {
+    console.log(`[qwen2api][chat] Upstream returned error (HTTP 200): ${upstreamErr.message}`);
+    return createResponse({ error: upstreamErr }, 502);
   }
   const parsedSse = parseQwenSsePayload(buffer);
   logChatDetail('core', 'chat.completion.collected', {
@@ -1843,6 +1880,8 @@ function createLogStreamWriter(writer, onDone = null) {
     const decoder = new TextDecoder();
     let buffer = '';
     let doneWritten = false;
+    let anyChunkWritten = false;
+    let nonDataBuffer = '';
 
     if (!reader) {
       throw new Error('Upstream response has no readable body');
@@ -1859,7 +1898,10 @@ function createLogStreamWriter(writer, onDone = null) {
 
         for (const line of lines) {
           const trimmed = line.trimStart();
-          if (!trimmed.startsWith('data:')) continue;
+          if (!trimmed.startsWith('data:')) {
+            nonDataBuffer += line + '\n';
+            continue;
+          }
           const data = trimmed.slice(5).trim();
           if (data === '[DONE]') {
             writer.write('data: [DONE]\n\n');
@@ -1898,6 +1940,7 @@ function createLogStreamWriter(writer, onDone = null) {
                 }
               };
               writer.write(`data: ${JSON.stringify(errObj)}\n\n`);
+              anyChunkWritten = true;
               continue;
             }
 
@@ -1915,8 +1958,20 @@ function createLogStreamWriter(writer, onDone = null) {
                 }],
               };
               writer.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              anyChunkWritten = true;
             }
           } catch {}
+        }
+      }
+      if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
+        nonDataBuffer += buffer;
+      }
+      if (!doneWritten && !anyChunkWritten) {
+        const err = tryParseUpstreamErrorPayload(nonDataBuffer);
+        if (err) {
+          writer.write(`data: ${JSON.stringify({ error: err })}\n\n`);
+          writer.write('data: [DONE]\n\n');
+          doneWritten = true;
         }
       }
     } catch (err) {
@@ -2151,7 +2206,9 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
     const errorText = await chatResp.text().catch(() => '');
     logChatDetail('core', 'chat.completion.error', { status: chatResp.status, chatId, error: errorText });
     sendLog('chat.response.failed', { status: chatResp.status, error: errorText });
-    return createResponse({ error: { message: errorText || `HTTP ${chatResp.status}`, type: 'api_error' } }, chatResp.status);
+    const parsedErr = tryParseUpstreamErrorPayload(errorText);
+    const errMsg = parsedErr?.message || errorText || `HTTP ${chatResp.status}`;
+    return createResponse({ error: { message: errMsg, type: 'api_error', ...(parsedErr?.code ? { code: parsedErr.code } : {}) } }, chatResp.status);
   }
 
   logChatDetail('core', 'chat.completion.started', { status: chatResp.status, chatId, stream: !!stream });
@@ -2188,6 +2245,12 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
+  }
+  const upstreamErr = tryParseUpstreamErrorPayload(buffer);
+  if (upstreamErr) {
+    console.log(`[qwen2api][chat-log] Upstream returned error (HTTP 200): ${upstreamErr.message}`);
+    sendLog('chat.response.failed', { error: upstreamErr.message });
+    return createResponse({ error: upstreamErr }, 502);
   }
   const parsedSse = parseQwenSsePayload(buffer);
 
@@ -2238,5 +2301,6 @@ module.exports = {
   mapUpstreamDeltaToOpenAI,
   parseQwenSsePayload,
   mapUsageToOpenAI,
+  tryParseUpstreamErrorPayload,
   uuidv4,
 };

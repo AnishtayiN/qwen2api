@@ -201,6 +201,46 @@ function extractUpstreamErrorFromSse(rawPayload) {
       }
     } catch {}
   }
+    } catch {}
+  }
+  return null;
+}
+
+function tryParseUpstreamErrorPayload(rawText) {
+  const text = typeof rawText === 'string' ? rawText : '';
+  const firstChar = text.trimStart().charAt(0);
+  if (firstChar !== '{' && firstChar !== '[') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  if (Array.isArray(parsed.ret)) {
+    const parts = parsed.ret.filter(p => typeof p === 'string' && p);
+    if (parts.length > 0) {
+      const code = parts[0];
+      const message = parts.slice(1).filter(Boolean).join(' | ') || code;
+      return { message, code, type: 'api_error' };
+    }
+  }
+
+  if (parsed.success === false) {
+    const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : {};
+    const message = data.details || data.message || data.msg || data.code || 'Upstream request failed';
+    return { message, code: data.code, type: 'api_error' };
+  }
+
+  if (parsed.error && typeof parsed.error === 'object') {
+    return {
+      message: parsed.error.message || 'Upstream request failed',
+      code: parsed.error.code,
+      type: parsed.error.type || 'api_error',
+    };
+  }
+
   return null;
 }
 
@@ -3042,17 +3082,10 @@ async function handleChatCompletions(body, authHeader) {
 
   if (!chatResp.ok) {
     const errorText = await chatResp.text().catch(() => '');
-    logChatDetail('vercel-edge', 'chat.completion.error', { status: chatResp.status, chatId });
-    console.log(`[qwen2api][vercel][chat] Completion error: HTTP ${chatResp.status}, body: ${errorText.slice(0, 500)}`);
-    let errMsg = errorText || `HTTP ${chatResp.status}`;
-    try {
-      const errJson = JSON.parse(errorText);
-      if (errJson?.data?.details) errMsg = errJson.data.details;
-      else if (errJson?.data?.message) errMsg = errJson.data.message;
-      else if (errJson?.data?.code) errMsg = errJson.data.code;
-      else if (errJson?.error?.message) errMsg = errJson.error.message;
-    } catch {}
-    return jsonResponse({ error: { message: errMsg, type: 'api_error' } }, chatResp.status);
+    logChatDetail('vercel-edge', 'chat.completion.error', { status: chatResp.status, chatId, error: errorText });
+    const parsedErr = tryParseUpstreamErrorPayload(errorText);
+    const errMsg = parsedErr?.message || errorText || `HTTP ${chatResp.status}`;
+    return jsonResponse({ error: { message: errMsg, type: 'api_error', ...(parsedErr?.code ? { code: parsedErr.code } : {}) } }, chatResp.status);
   }
   logChatDetail('vercel-edge', 'chat.completion.started', { status: chatResp.status, chatId, stream: !!stream });
 
@@ -3071,6 +3104,8 @@ async function handleChatCompletions(body, authHeader) {
       const decoder = new TextDecoder();
       let buffer = '';
       let doneWritten = false;
+      let nonDataBuffer = '';
+      let anyChunkWritten = false;
 
       try {
         while (true) {
@@ -3083,11 +3118,15 @@ async function handleChatCompletions(body, authHeader) {
 
           for (const line of lines) {
             const trimmed = line.trimStart();
-            if (!trimmed.startsWith('data:')) continue;
+            if (!trimmed.startsWith('data:')) {
+              nonDataBuffer += (nonDataBuffer ? '\n' : '') + line;
+              continue;
+            }
             const data = trimmed.slice(5).trim();
             if (data === '[DONE]') {
               await writer.write(encoder.encode('data: [DONE]\n\n'));
               doneWritten = true;
+              anyChunkWritten = true;
               continue;
             }
 
@@ -3111,6 +3150,7 @@ async function handleChatCompletions(body, authHeader) {
                   };
                   await writer.write(encoder.encode(`data: ${JSON.stringify(warningChunk)}\n\n`));
                   doneWritten = true;
+                  anyChunkWritten = true;
                   await writer.write(encoder.encode('data: [DONE]\n\n'));
                   continue;
                 }
@@ -3122,6 +3162,7 @@ async function handleChatCompletions(body, authHeader) {
                   }
                 };
                 await writer.write(encoder.encode(`data: ${JSON.stringify(errObj)}\n\n`));
+                anyChunkWritten = true;
                 continue;
               }
               const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
@@ -3138,10 +3179,19 @@ async function handleChatCompletions(body, authHeader) {
                   }]
                 };
                 await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                anyChunkWritten = true;
               }
             } catch (streamParseError) {
               void streamParseError;
             }
+          }
+        }
+        if (!anyChunkWritten && nonDataBuffer) {
+          const upstreamErr = tryParseUpstreamErrorPayload(nonDataBuffer);
+          if (upstreamErr) {
+            logChatDetail('vercel-edge', 'chat.completion.error', { message: upstreamErr.message });
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ error: upstreamErr })}\n\n`));
+            doneWritten = true;
           }
         }
       } catch (err) {
@@ -3174,6 +3224,11 @@ async function handleChatCompletions(body, authHeader) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
+  }
+  const upstreamErr = tryParseUpstreamErrorPayload(buffer);
+  if (upstreamErr) {
+    logChatDetail('vercel-edge', 'chat.completion.error', { message: upstreamErr.message });
+    return jsonResponse({ error: upstreamErr }, 502);
   }
   const parsedSse = parseQwenSsePayload(buffer);
   logChatDetail('vercel-edge', 'chat.completion.collected', {
