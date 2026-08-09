@@ -1345,7 +1345,7 @@ async function handleImageGenerations(body, authHeader, env) {
     return createResponse({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400);
   }
 
-  const actualModel = normalizeInputString(body?.model) || 'qwen3.5-plus';
+  const actualModel = normalizeInputString(body?.model) || 'qwen3.8-max';
   const nRaw = body?.n;
   let n = Number.isFinite(nRaw) ? Number(nRaw) : Number.parseInt(String(nRaw || ''), 10);
   if (!Number.isFinite(n) || n <= 0) n = 1;
@@ -1493,12 +1493,12 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
 
   logChatDetail('core', 'request.received', {
     stream: !!stream,
-    model: model || 'qwen3.5-plus',
+    model: model || 'qwen3.8-max',
     messageCount: Array.isArray(messages) ? messages.length : 0,
     hasTools: !!(tools && Array.isArray(tools) && tools.length > 0),
   });
 
-  const actualModel = model || 'qwen3.5-plus';
+  const actualModel = model || 'qwen3.8-max';
 
   // 检查是否启用搜索
   const enableSearch = (env?.ENABLE_SEARCH || process?.env?.ENABLE_SEARCH || '').toLowerCase() === 'true';
@@ -2082,13 +2082,13 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
 
   logChatDetail('core', 'request.received', {
     stream: !!stream,
-    model: model || 'qwen3.5-plus',
+    model: model || 'qwen3.8-max',
     messageCount: Array.isArray(messages) ? messages.length : 0,
     hasTools: !!(tools && Array.isArray(tools) && tools.length > 0),
   });
-  sendLog('request.received', { model: model || 'qwen3.5-plus', messageCount: messages.length });
+  sendLog('request.received', { model: model || 'qwen3.8-max', messageCount: messages.length });
 
-  const actualModel = model || 'qwen3.5-plus';
+  const actualModel = model || 'qwen3.8-max';
 
   // 检查是否启用搜索
   const enableSearch = (env?.ENABLE_SEARCH || process?.env?.ENABLE_SEARCH || '').toLowerCase() === 'true';
