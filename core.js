@@ -22,7 +22,7 @@ const CACHE_TTL = 4 * 60 * 1000;
 const QWEN_BASE_URL = 'https://chat.qwen.ai';
 const QWEN_WEB_REFERER = `${QWEN_BASE_URL}/`;
 const QWEN_GUEST_REFERER = `${QWEN_BASE_URL}/c/guest`;
-const WEB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+const WEB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 const WEB_ACCEPT_LANGUAGE = 'zh-CN,zh;q=0.9,en;q=0.8';
 let tokenCache = null;
 let tokenCacheTime = 0;
@@ -104,25 +104,119 @@ function encodeBaxiaToken(data) {
   return `${BAXIA_VERSION.replace(/\./g, '')}!${encoded}`;
 }
 
-async function getBaxiaTokens() {
+async function getBaxiaTokens(forceRefresh) {
   const now = Date.now();
-  if (tokenCache && (now - tokenCacheTime) < CACHE_TTL) {
+  if (!forceRefresh && tokenCache && (now - tokenCacheTime) < CACHE_TTL) {
     return tokenCache;
   }
-  
+
+  // 优先用真实 baxia SDK（系统 Chrome 无头模式生成有效 token）。
+  // 仅在本地 Node 环境可用；serverless 无 Chrome 时自动回退 wu.json。
+  if (process.env.USE_CHROME_BAXIA !== 'false' && typeof process.versions.node === 'string') {
+    try {
+      const { getBaxiaTokens: getChromeTokens } = require('./scripts/baxia-token.js');
+      const t = await getChromeTokens();
+      if (t && t.bxUmidToken && /^T2gA/i.test(t.bxUmidToken)) {
+        const result = { bxUa: t.bxUa, bxUmidToken: t.bxUmidToken, bxV: t.bxV || '2.5.37', cookies: t.cookies || '' };
+        tokenCache = result;
+        tokenCacheTime = now;
+        return result;
+      } else {
+        console.log('[qwen2api][baxia] Chrome branch returned invalid token, fallback');
+      }
+    } catch (e) {
+      console.log('[qwen2api][baxia] Chrome branch failed:', e.message);
+    }
+  }
+
   const bxUa = encodeBaxiaToken(await collectFingerprintData());
   let bxUmidToken;
   try {
     const resp = await fetch('https://sg-wum.alibaba.com/w/wu.json', {
       headers: { 'User-Agent': WEB_USER_AGENT }
     });
-    bxUmidToken = resp.headers.get('etag') || 'T2gA' + randomString(40);
-  } catch { bxUmidToken = 'T2gA' + randomString(40); }
+    const bodyText = await resp.text();
+    // wu.json body: try{umx.wu('T2gA...');}catch(e){} try{__fycb('T2gA...');}catch(e){}
+    // The token inside is the real umid token required by the upstream API.
+    const m = bodyText.match(/umx\.wu\('([^']+)'\)/) || bodyText.match(/'([^']+)'/);
+    bxUmidToken = (m && m[1]) || resp.headers.get('etag') || '';
+  } catch { bxUmidToken = ''; }
+  if (!bxUmidToken || !/^T2gA/i.test(bxUmidToken)) {
+    // Fallback only to avoid crashing; upstream will likely reject a fake token.
+    bxUmidToken = 'T2gA' + randomString(40);
+  }
   
   const result = { bxUa, bxUmidToken, bxV: BAXIA_VERSION };
   tokenCache = result;
   tokenCacheTime = now;
   return result;
+}
+
+// 创建会话，失败（风控/网络）时自动换 token 重试
+async function createChatSession(actualModel, chatType, retries = 3) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const { bxUa, bxUmidToken, bxV, cookies } = await getBaxiaTokens(attempt > 0);
+    try {
+      const createHeaders = {
+        'Accept': 'application/json', 'Content-Type': 'application/json',
+        'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
+        'Cookie': cookies,
+        'Origin': QWEN_BASE_URL,
+        'Referer': QWEN_GUEST_REFERER, 'source': 'web',
+        'version': '0.2.83',
+        'User-Agent': WEB_USER_AGENT,
+        'Accept-Language': WEB_ACCEPT_LANGUAGE,
+        'x-request-id': uuidv4()
+      };
+      const createBody = {
+        title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: chatType,
+        timestamp: Date.now(), project_id: ''
+      };
+      const createResp = await fetch(`${QWEN_BASE_URL}/api/v2/chats/new`, {
+        method: 'POST',
+        headers: createHeaders,
+        body: JSON.stringify(createBody)
+      });
+      const createParsed = await safeReadJson(createResp);
+      if (!createParsed.ok) {
+        lastErr = { parsed: createParsed, status: createResp.status, resp: createResp };
+        const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
+        console.log(`[qwen2api][chat] Create chat session failed (attempt ${attempt + 1}): HTTP ${createResp.status}, body: ${preview}`);
+        continue;
+      }
+      const createData = createParsed.data;
+      if (!createData.success || !createData.data?.id) {
+        const parsedErr = tryParseUpstreamErrorPayload(createParsed.rawText);
+        lastErr = { parsed: createParsed, status: createResp.status, resp: createResp, parsedErr };
+        console.log(`[qwen2api][chat] Create chat session error (attempt ${attempt + 1}): ${JSON.stringify(createData?.data || createData)}`);
+        // 风控/限流类错误值得重试
+        if (parsedErr?.riskControlled || parsedErr?.code === 'rgv587' || /rgv.?587/i.test(createParsed.rawText || '')) {
+          await new Promise(resolve => setTimeout(resolve, 600));
+          continue;
+        }
+        return createResponse({ error: { message: createData?.data?.details || createData?.data?.message || createData?.data?.code || parsedErr?.message || 'Failed to create chat session', type: 'api_error', ...(parsedErr?.code ? { code: parsedErr.code } : {}) } }, 500);
+      }
+      return { chatId: createData.data.id, bxUa, bxUmidToken, bxV, cookies };
+    } catch (err) {
+      lastErr = { error: err, status: 0, resp: null };
+      console.log(`[qwen2api][chat] Create chat session exception (attempt ${attempt + 1}): ${err && err.message ? err.message : String(err)}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  // 全部失败，返回最合理的错误
+  const last = lastErr || {};
+  if (last.parsed) {
+    const parsed = last.parsed;
+    const preview = parsed.rawText ? parsed.rawText.slice(0, 300) : '(empty)';
+    const wafMatch = preview.match(/aliyun_waf/i);
+    const msg = wafMatch
+      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
+      : (last.parsedErr?.message || `Failed to create chat session: upstream returned non-JSON response (HTTP ${last.status}).`);
+    return createResponse({ error: { message: msg, type: 'api_error', ...(last.parsedErr?.code ? { code: last.parsedErr.code } : {}) } }, last.status && last.status >= 400 ? last.status : 502);
+  }
+  const errMsg = last.error && last.error.message ? last.error.message : 'Failed to create chat session';
+  return createResponse({ error: { message: errMsg, type: 'api_error' } }, 502);
 }
 
 // ============================================
@@ -526,7 +620,37 @@ function extractUpstreamErrorFromSse(rawPayload) {
   return null;
 }
 
+// Upstream risk-control returns HTTP 200 with an Aliyun punish payload like:
+// {"rgv587_flag":"sm","url":"https://bixi.alicdn.com/punish/...?...&action=deny&pureDenyWait="}
+// Surface the upstream content as a readable error instead of a silent "HTTP 200".
+function tryParseRiskControlPayload(rawText) {
+  const text = typeof rawText === 'string' ? rawText : '';
+  const firstChar = text.trimStart().charAt(0);
+  if (firstChar !== '{' && firstChar !== '[') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  const punishUrl = typeof parsed.url === 'string' && /punish|action=deny|pureDenyWait/i.test(parsed.url) ? parsed.url : '';
+  const hasRiskFlag = typeof parsed.rgv587_flag === 'string' || typeof parsed['rgv-flag'] === 'string';
+  if (!hasRiskFlag && !punishUrl) return null;
+
+  let message = '';
+  if (typeof parsed.details === 'string' && parsed.details) message = parsed.details;
+  else if (typeof parsed.message === 'string' && parsed.message) message = parsed.message;
+  else if (typeof parsed.error === 'string' && parsed.error) message = parsed.error;
+  else if (punishUrl) message = punishUrl;
+  if (!message) message = text;
+  return { message, code: parsed.rgv587_flag || 'rgv587', type: 'api_error', riskControlled: true };
+}
+
 function tryParseUpstreamErrorPayload(rawText) {
+  const risk = tryParseRiskControlPayload(rawText);
+  if (risk) return risk;
   const text = typeof rawText === 'string' ? rawText : '';
   const firstChar = text.trimStart().charAt(0);
   if (firstChar !== '{' && firstChar !== '[') return null;
@@ -1233,51 +1357,12 @@ async function handleImageGenerations(body, authHeader, env) {
   }
 
   const qwenRatio = mapOpenAiImageSizeToQwenRatio(body?.size);
-  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
-
-  // 创建 t2i 会话
-  const createResp = await fetch(`${QWEN_BASE_URL}/api/v2/chats/new`, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'bx-ua': bxUa,
-      'bx-umidtoken': bxUmidToken,
-      'bx-v': bxV,
-      'Referer': QWEN_GUEST_REFERER,
-      'source': 'web',
-      'User-Agent': WEB_USER_AGENT,
-      'Accept-Language': WEB_ACCEPT_LANGUAGE,
-      'x-request-id': uuidv4(),
-    },
-    body: JSON.stringify({
-      title: '新建对话',
-      models: [actualModel],
-      chat_mode: 'guest',
-      chat_type: 't2i',
-      timestamp: Date.now(),
-      project_id: '',
-    }),
-  });
-  const createParsed = await safeReadJson(createResp);
-  if (!createParsed.ok) {
-    const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
-    console.log(`[qwen2api][image] Create chat session failed: HTTP ${createResp.status}, body: ${preview}`);
-    const wafMatch = preview.match(/aliyun_waf/i);
-    const msg = wafMatch
-      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
-      : `Failed to create image chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
-    return createResponse({
-      error: { message: msg, type: 'api_error' },
-    }, createResp.ok ? 502 : createResp.status);
+  // 创建 t2i 会话（失败自动换 token 重试）
+  const createdChat = await createChatSession(actualModel, 't2i');
+  if (createdChat.statusCode) {
+    return createdChat;
   }
-  const createData = createParsed.data;
-  if (!createData?.success || !createData?.data?.id) {
-    const errMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || 'Failed to create image chat session';
-    console.log(`[qwen2api][image] Create chat session error: ${JSON.stringify(createData?.data || createData)}`);
-    return createResponse({ error: { message: errMsg, type: 'api_error' } }, 500);
-  }
-  const chatId = createData.data.id;
+  const { chatId, bxUa, bxUmidToken, bxV, cookies } = createdChat;
 
   // 尽力把 n 映射给上游：上游未发现显式参数，只能通过 prompt 提示。
   const finalPrompt = n === 1 ? prompt : `${prompt}\n\n(Generate ${n} images.)`;
@@ -1290,8 +1375,11 @@ async function handleImageGenerations(body, authHeader, env) {
       'bx-ua': bxUa,
       'bx-umidtoken': bxUmidToken,
       'bx-v': bxV,
+      'Cookie': cookies,
+      'x-accel-buffering': 'no',
+      'Origin': QWEN_BASE_URL,
       'source': 'web',
-      'version': '0.2.9',
+      'version': '0.2.83',
       'Referer': QWEN_GUEST_REFERER,
       'User-Agent': WEB_USER_AGENT,
       'Accept-Language': WEB_ACCEPT_LANGUAGE,
@@ -1411,48 +1499,18 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   });
 
   const actualModel = model || 'qwen3.5-plus';
-  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
 
   // 检查是否启用搜索
   const enableSearch = (env?.ENABLE_SEARCH || process?.env?.ENABLE_SEARCH || '').toLowerCase() === 'true';
   const chatType = enableSearch ? 'search' : 't2t';
   logChatDetail('core', 'request.config', { actualModel, chatType, enableSearch });
 
-  // 创建会话
-  const createResp = await fetch(`${QWEN_BASE_URL}/api/v2/chats/new`, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json', 'Content-Type': 'application/json',
-      'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-      'Referer': QWEN_GUEST_REFERER, 'source': 'web',
-      'User-Agent': WEB_USER_AGENT,
-      'Accept-Language': WEB_ACCEPT_LANGUAGE,
-      'x-request-id': uuidv4()
-    },
-    body: JSON.stringify({
-      title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: chatType,
-      timestamp: Date.now(), project_id: ''
-    })
-  });
-  const createParsed = await safeReadJson(createResp);
-  if (!createParsed.ok) {
-    const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
-    console.log(`[qwen2api][chat] Create chat session failed: HTTP ${createResp.status}, body: ${preview}`);
-    const wafMatch = preview.match(/aliyun_waf/i);
-    const msg = wafMatch
-      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
-      : `Failed to create chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
-    return createResponse({
-      error: { message: msg, type: 'api_error' }
-    }, createResp.ok ? 502 : createResp.status);
+  // 创建会话（失败自动换 token 重试）
+  const createdChat = await createChatSession(actualModel, chatType);
+  if (createdChat.statusCode) {
+    return createdChat;
   }
-  const createData = createParsed.data;
-  if (!createData.success || !createData.data?.id) {
-    const errMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || 'Failed to create chat session';
-    console.log(`[qwen2api][chat] Create chat session error: ${JSON.stringify(createData?.data || createData)}`);
-    return createResponse({ error: { message: errMsg, type: 'api_error' } }, 500);
-  }
-  const chatId = createData.data.id;
+  const { chatId, bxUa, bxUmidToken, bxV, cookies } = createdChat;
 
   // 解析 OpenAI 兼容消息与附件
   const parsedMessages = parseIncomingMessages(messages);
@@ -1474,7 +1532,10 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
     headers: {
       'Accept': 'application/json', 'Content-Type': 'application/json',
       'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-      'source': 'web', 'version': '0.2.9', 'Referer': QWEN_GUEST_REFERER,
+      'Cookie': cookies,
+      'x-accel-buffering': 'no',
+      'Origin': QWEN_BASE_URL,
+      'source': 'web', 'version': '0.2.83', 'Referer': QWEN_GUEST_REFERER,
       'User-Agent': WEB_USER_AGENT,
       'Accept-Language': WEB_ACCEPT_LANGUAGE,
       'x-request-id': uuidv4()
@@ -1483,9 +1544,9 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
       stream: true, version: '2.1', incremental_output: true,
       chat_id: chatId, chat_mode: 'guest', model: actualModel, parent_id: null,
       messages: [{
-        fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content,
-        user_action: 'chat', files: uploadedFiles, timestamp: Date.now(), models: [actualModel], chat_type: chatType,
-        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_format: 'summary', auto_search: enableSearch },
+        id: null, fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content,
+        user_action: 'chat', files: uploadedFiles, timestamp: Date.now(), models: [actualModel], model: '', chat_type: chatType,
+        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_mode: 'Auto', thinking_format: 'summary', auto_search: enableSearch },
         extra: { meta: { subChatType: chatType } }, sub_chat_type: chatType, parent_id: null
       }],
       timestamp: Date.now()
@@ -2028,7 +2089,6 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
   sendLog('request.received', { model: model || 'qwen3.5-plus', messageCount: messages.length });
 
   const actualModel = model || 'qwen3.5-plus';
-  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
 
   // 检查是否启用搜索
   const enableSearch = (env?.ENABLE_SEARCH || process?.env?.ENABLE_SEARCH || '').toLowerCase() === 'true';
@@ -2036,61 +2096,14 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
   logChatDetail('core', 'request.config', { actualModel, chatType, enableSearch });
   sendLog('config.ready', { model: actualModel, chatType, enableSearch });
 
-  // 创建会话
+  // 创建会话（失败自动换 token 重试）
   sendLog('chat.creating', {});
-  const createResp = await fetch(`${QWEN_BASE_URL}/api/v2/chats/new`, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json', 'Content-Type': 'application/json',
-      'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-      'Referer': QWEN_GUEST_REFERER, 'source': 'web',
-      'User-Agent': WEB_USER_AGENT,
-      'Accept-Language': WEB_ACCEPT_LANGUAGE,
-      'x-request-id': uuidv4()
-    },
-    body: JSON.stringify({
-      title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: chatType,
-      timestamp: Date.now(), project_id: ''
-    })
-  });
-  const createParsed = await safeReadJson(createResp);
-  if (!createParsed.ok) {
-    const bodyPreview = previewBody(createParsed.rawText);
-    const looksLikeHtmlBlock = /^\s*<!doctype|^\s*<html/i.test(createParsed.rawText || '');
-    logChatDetail('core', 'chat.create.parse.error', {
-      status: createResp.status,
-      contentType: createResp.headers.get('content-type') || '',
-      bodyPreview,
-      parseError: createParsed.parseError?.message || '',
-    });
-    sendLog('chat.create.failed', {
-      status: createResp.status,
-      error: 'non-json-response',
-      contentType: createResp.headers.get('content-type') || '',
-      bodyPreview,
-      blockedLikely: looksLikeHtmlBlock,
-    });
-    return createResponse({
-      error: {
-        message: `Failed to create chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`,
-        type: 'api_error'
-      }
-    }, createResp.ok ? 502 : createResp.status);
+  const createdChat = await createChatSession(actualModel, chatType);
+  if (createdChat.statusCode) {
+    sendLog('chat.create.failed', { status: createdChat.statusCode, error: 'create-failed', response: null });
+    return createdChat;
   }
-  const createData = createParsed.data;
-  logChatDetail('core', 'chat.create.response', {
-    status: createResp.status,
-    success: !!createData?.success,
-    hasChatId: !!createData?.data?.id,
-  });
-  if (!createResp.ok || !createData.success || !createData.data?.id) {
-    const parsedErr = tryParseUpstreamErrorPayload(createParsed.rawText);
-    const errorMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || parsedErr?.message || `HTTP ${createResp.status}`;
-    logChatDetail('core', 'chat.create.error', { status: createResp.status, error: errorMsg });
-    sendLog('chat.create.failed', { status: createResp.status, error: errorMsg, response: createData });
-    return createResponse({ error: { message: `Failed to create chat session: ${errorMsg}`, type: 'api_error' } }, createResp.ok ? 500 : createResp.status);
-  }
-  const chatId = createData.data.id;
+  const { chatId, bxUa, bxUmidToken, bxV, cookies } = createdChat;
   sendLog('chat.created', { chatId });
 
   // 解析消息与附件
@@ -2185,7 +2198,10 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
     headers: {
       'Accept': 'application/json', 'Content-Type': 'application/json',
       'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-      'source': 'web', 'version': '0.2.9', 'Referer': QWEN_GUEST_REFERER,
+      'Cookie': cookies,
+      'x-accel-buffering': 'no',
+      'Origin': QWEN_BASE_URL,
+      'source': 'web', 'version': '0.2.83', 'Referer': QWEN_GUEST_REFERER,
       'User-Agent': WEB_USER_AGENT,
       'Accept-Language': WEB_ACCEPT_LANGUAGE,
       'x-request-id': uuidv4()
@@ -2194,9 +2210,9 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
       stream: true, version: '2.1', incremental_output: true,
       chat_id: chatId, chat_mode: 'guest', model: actualModel, parent_id: null,
       messages: [{
-        fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content,
-        user_action: 'chat', files: uploadedFiles, timestamp: Date.now(), models: [actualModel], chat_type: chatType,
-        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_format: 'summary', auto_search: enableSearch },
+        id: null, fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content,
+        user_action: 'chat', files: uploadedFiles, timestamp: Date.now(), models: [actualModel], model: '', chat_type: chatType,
+        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_mode: 'Auto', thinking_format: 'summary', auto_search: enableSearch },
         extra: { meta: { subChatType: chatType } }, sub_chat_type: chatType, parent_id: null
       }],
       timestamp: Date.now()

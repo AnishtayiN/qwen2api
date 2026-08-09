@@ -70,8 +70,15 @@ async function getBaxiaTokens() {
     const resp = await fetch('https://sg-wum.alibaba.com/w/wu.json', {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
-    bxUmidToken = resp.headers.get('etag') || 'T2gA' + randomString(40);
-  } catch { bxUmidToken = 'T2gA' + randomString(40); }
+    const bodyText = await resp.text();
+    // wu.json body: try{umx.wu('T2gA...');}catch(e){} try{__fycb('T2gA...');}catch(e){}
+    // The token inside is the real umid token required by the upstream API.
+    const m = bodyText.match(/umx\.wu\('([^']+)'\)/) || bodyText.match(/'([^']+)'/);
+    bxUmidToken = (m && m[1]) || resp.headers.get('etag') || '';
+  } catch { bxUmidToken = ''; }
+  if (!bxUmidToken || !/^T2gA/i.test(bxUmidToken)) {
+    bxUmidToken = 'T2gA' + randomString(40);
+  }
   return { bxUa, bxUmidToken, bxV: BAXIA_VERSION };
 }
 
@@ -211,7 +218,37 @@ function extractUpstreamErrorFromSse(rawPayload) {
   return null;
 }
 
+// Upstream risk-control returns HTTP 200 with an Aliyun punish payload like:
+// {"rgv587_flag":"sm","url":"https://bixi.alicdn.com/punish/...?...&action=deny&pureDenyWait="}
+// Surface the upstream content as a readable error instead of a silent "HTTP 200".
+function tryParseRiskControlPayload(rawText) {
+  const text = typeof rawText === 'string' ? rawText : '';
+  const firstChar = text.trimStart().charAt(0);
+  if (firstChar !== '{' && firstChar !== '[') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  const punishUrl = typeof parsed.url === 'string' && /punish|action=deny|pureDenyWait/i.test(parsed.url) ? parsed.url : '';
+  const hasRiskFlag = typeof parsed.rgv587_flag === 'string' || typeof parsed['rgv-flag'] === 'string';
+  if (!hasRiskFlag && !punishUrl) return null;
+
+  let message = '';
+  if (typeof parsed.details === 'string' && parsed.details) message = parsed.details;
+  else if (typeof parsed.message === 'string' && parsed.message) message = parsed.message;
+  else if (typeof parsed.error === 'string' && parsed.error) message = parsed.error;
+  else if (punishUrl) message = punishUrl;
+  if (!message) message = text;
+  return { message, code: parsed.rgv587_flag || 'rgv587', type: 'api_error', riskControlled: true };
+}
+
 function tryParseUpstreamErrorPayload(rawText) {
+  const risk = tryParseRiskControlPayload(rawText);
+  if (risk) return risk;
   const text = typeof rawText === 'string' ? rawText : '';
   const firstChar = text.trimStart().charAt(0);
   if (firstChar !== '{' && firstChar !== '[') return null;
@@ -2995,51 +3032,68 @@ async function handleChatCompletions(body, authHeader, env) {
   });
 
   const actualModel = model || 'qwen3.5-plus';
-  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
-
   // 检查是否启用搜索
   const enableSearch = (env.ENABLE_SEARCH || '').toLowerCase() === 'true';
   const chatType = enableSearch ? 'search' : 't2t';
   logChatDetail('netlify-edge', 'request.config', { actualModel, chatType, enableSearch });
 
-  // 创建会话
-  const createResp = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-      'Referer': 'https://chat.qwen.ai/c/guest', 'source': 'web',
-      'x-request-id': uuidv4()
-    },
-    body: JSON.stringify({
-      title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: chatType,
-      timestamp: Date.now(), project_id: ''
-    })
-  });
-  const createParsed = await safeReadJson(createResp);
-  logChatDetail('netlify-edge', 'chat.create.response', {
-    status: createResp.status,
-    parseOk: createParsed.ok,
-    success: !!createParsed.data?.success,
-    hasChatId: !!createParsed.data?.data?.id,
-  });
-  if (!createParsed.ok) {
-    const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
-    console.log(`[qwen2api][netlify][chat] Create chat session failed: HTTP ${createResp.status}, body: ${preview}`);
-    const wafMatch = preview.match(/aliyun_waf/i);
-    const msg = wafMatch
-      ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
-      : `Failed to create chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
-    return jsonResponse({ error: { message: msg, type: 'api_error' } }, createResp.ok ? 502 : createResp.status);
+  // 创建会话（失败自动换 token 重试）
+  let bxUa, bxUmidToken, bxV, chatId;
+  let createFailMsg = '';
+  let createFailStatus = 500;
+  let createdOk = false;
+  for (let attempt = 0; attempt <= 3 && !createdOk; attempt++) {
+    const tokens = await getBaxiaTokens();
+    bxUa = tokens.bxUa; bxUmidToken = tokens.bxUmidToken; bxV = tokens.bxV;
+    const createResp = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
+        'Referer': 'https://chat.qwen.ai/c/guest', 'source': 'web',
+        'x-request-id': uuidv4()
+      },
+      body: JSON.stringify({
+        title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: chatType,
+        timestamp: Date.now(), project_id: ''
+      })
+    });
+    const createParsed = await safeReadJson(createResp);
+    logChatDetail('netlify-edge', 'chat.create.response', {
+      status: createResp.status,
+      parseOk: createParsed.ok,
+      success: !!createParsed.data?.success,
+      hasChatId: !!createParsed.data?.data?.id,
+    });
+    if (!createParsed.ok) {
+      const preview = createParsed.rawText ? createParsed.rawText.slice(0, 300) : '(empty)';
+      console.log(`[qwen2api][netlify][chat] Create chat session failed (attempt ${attempt + 1}): HTTP ${createResp.status}, body: ${preview}`);
+      const wafMatch = preview.match(/aliyun_waf/i);
+      createFailMsg = wafMatch
+        ? 'Upstream WAF blocked the request. The IP may be rate-limited or banned by Aliyun WAF.'
+        : `Failed to create chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`;
+      createFailStatus = createResp.ok ? 502 : createResp.status;
+      continue;
+    }
+    const createData = createParsed.data;
+    if (!createData?.success || !createData?.data?.id) {
+      const parsedCreateErr = tryParseUpstreamErrorPayload(createParsed.rawText);
+      createFailMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || parsedCreateErr?.message || 'Failed to create chat session';
+      createFailStatus = 500;
+      console.log(`[qwen2api][netlify][chat] Create chat session error (attempt ${attempt + 1}): ${JSON.stringify(createData?.data || createData)}`);
+      if (parsedCreateErr?.riskControlled || parsedCreateErr?.code === 'rgv587' || /rgv.?587/i.test(createParsed.rawText || '')) {
+        await new Promise(resolve => setTimeout(resolve, 600));
+        continue;
+      }
+      return jsonResponse({ error: { message: createFailMsg, type: 'api_error', ...(parsedCreateErr?.code ? { code: parsedCreateErr.code } : {}) } }, createFailStatus);
+    }
+    chatId = createData.data.id;
+    createdOk = true;
   }
-  const createData = createParsed.data;
-  if (!createData?.success || !createData?.data?.id) {
-    const errMsg = createData?.data?.details || createData?.data?.message || createData?.data?.code || 'Failed to create chat session';
-    console.log(`[qwen2api][netlify][chat] Create chat session error: ${JSON.stringify(createData?.data || createData)}`);
-    return jsonResponse({ error: { message: errMsg, type: 'api_error' } }, 500);
+  if (!createdOk) {
+    return jsonResponse({ error: { message: createFailMsg || 'Failed to create chat session', type: 'api_error' } }, createFailStatus || 502);
   }
-  const chatId = createData.data.id;
 
   const parsedMessages = parseIncomingMessages(messages);
   const content = parsedMessages.content;
@@ -3058,7 +3112,7 @@ async function handleChatCompletions(body, authHeader, env) {
     headers: {
       'Accept': 'application/json', 'Content-Type': 'application/json',
       'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-      'source': 'web', 'version': '0.2.9', 'Referer': 'https://chat.qwen.ai/c/guest', 'x-request-id': uuidv4()
+      'x-accel-buffering': 'no', 'source': 'web', 'version': '0.2.83', 'Referer': 'https://chat.qwen.ai/c/guest', 'x-request-id': uuidv4()
     },
     body: JSON.stringify({
       stream: true, version: '2.1', incremental_output: true,
@@ -3300,7 +3354,7 @@ async function handleImageGenerations(body, authHeader, env) {
     headers: {
       'Accept': 'application/json', 'Content-Type': 'application/json',
       'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-      'source': 'web', 'version': '0.2.9', 'Referer': 'https://chat.qwen.ai/c/guest', 'x-request-id': uuidv4(),
+      'x-accel-buffering': 'no', 'source': 'web', 'version': '0.2.83', 'Referer': 'https://chat.qwen.ai/c/guest', 'x-request-id': uuidv4(),
     },
     body: JSON.stringify({
       stream: true, version: '2.1', incremental_output: true,
