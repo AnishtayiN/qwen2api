@@ -120,4 +120,8 @@ module.exports = async function handler(req, res) {
   return res.status(404).json({ error: { message: 'Not found', type: 'invalid_request_error' } });
 };
 
-module.exports.config = { maxDuration: 60 };
+// Vercel 函数最大执行时长（秒）：
+// - Hobby 计划硬顶 60s（超出的配置会被钳制到 60）
+// - Pro 计划最高 300s，Enterprise 最高 800s
+// 附件上传（OSS PUT + 状态轮询）耗时较长，Pro 及以上请保持较大值。
+module.exports.config = { maxDuration: 300 };

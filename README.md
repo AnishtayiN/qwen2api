@@ -42,7 +42,7 @@ uploads, streaming and error handling therefore behave identically everywhere.
 │                                                                          │
 │   index.js              api/index.js       netlify/functions/api.js      │
 │   (Express,             (Vercel Node fn,   (Netlify Node fn,             │
-│    local / Docker)       maxDuration 60s)   timeout 26s / 10s)           │
+│    local / Docker)       maxDuration)         timeout)                   │
 │   worker.js                                                              │
 │   (CF Worker, nodejs_compat)                                             │
 └───────────────────────────────────┬─────────────────────────────────────┘
@@ -111,7 +111,7 @@ body: {
 | Real baxia token (Chromium) | ✅ | ❌ simplified | ❌ simplified | ❌ simplified |
 | Live SSE streaming | ✅ | ✅ | ⚠️ buffered | ✅ |
 | Video analysis (yt-dlp) | ✅ | ❌ | ❌ | ❌ |
-| Attachment upload (OSS) | ✅ | ✅ 60s limit | ✅ 26s / 10s | ✅ 30s CPU |
+| Attachment upload (OSS) | ✅ | ✅  | ✅  | ✅  |
 | Chat page `/chat` | ✅ file | ✅ inline | ✅ inline | ✅ inline |
 
 ### Design notes
@@ -172,7 +172,7 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 > control; stability is lower than local/Docker.
 > The Vercel entry (`api/index.js`) uses the **Node.js runtime** and shares the
 > same `core.js` logic as local/Docker and Netlify. Function timeout is set via
-> `module.exports.config.maxDuration` (60s on Hobby, higher on Pro); SSE streaming
+> `module.exports.config.maxDuration` (capped by your Vercel plan); SSE streaming
 > is forwarded in real time (Vercel Node functions support streaming).
 
 ### Netlify
@@ -185,8 +185,7 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 
 > Netlify Functions (Node runtime) are also serverless and **cannot run Chromium**,
 > so behavior is similar to Vercel: simplified token + automatic retry, limited stability.
-> The function timeout is configured in `netlify.toml` (max 26s on Pro/Enterprise,
-> 10s on the free Hobby plan); streaming responses are buffered and returned whole.
+> The function timeout is configured in `netlify.toml` (capped by your Netlify plan); streaming responses are buffered and returned whole.
 
 ### Cloudflare Workers
 

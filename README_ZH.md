@@ -32,7 +32,7 @@
 │                                                                          │
 │   index.js              api/index.js       netlify/functions/api.js      │
 │   (Express,             (Vercel Node 函数,  (Netlify Node 函数,           │
-│    本地 / Docker)        maxDuration 60s)    timeout 26s / 10s)          │
+│    本地 / Docker)        maxDuration)         timeout)                    │
 │   worker.js                                                              │
 │   (CF Worker, nodejs_compat)                                             │
 └───────────────────────────────────┬─────────────────────────────────────┘
@@ -100,7 +100,7 @@ body: {
 | 真实 baxia token（Chromium） | ✅ | ❌ 简化 | ❌ 简化 | ❌ 简化 |
 | 实时 SSE 流式 | ✅ | ✅ | ⚠️ 缓冲 | ✅ |
 | 视频分析（yt-dlp） | ✅ | ❌ | ❌ | ❌ |
-| 附件上传（OSS） | ✅ | ✅ 60s 限制 | ✅ 26s / 10s | ✅ 30s CPU |
+| 附件上传（OSS） | ✅ | ✅  | ✅  | ✅  |
 | 聊天页 /chat | ✅ 读文件 | ✅ 内联副本 | ✅ 内联副本 | ✅ 内联副本 |
 
 ### 设计要点
@@ -150,7 +150,7 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 > 简化的 token 获取方式。可能间歇性被上游风控，稳定性不如本地/Docker。
 > Vercel 入口（`api/index.js`）使用 **Node.js 运行时**，与本地 / Netlify 共用
 > 同一套 `core.js` 逻辑。函数超时通过 `module.exports.config.maxDuration` 配置
-> （Hobby 上限 60s，Pro 可更高）；SSE 流式响应实时转发（Vercel Node 函数支持流式）。
+> （上限由 Vercel 计划决定）；SSE 流式响应实时转发（Vercel Node 函数支持流式）。
 
 ### Netlify
 
@@ -162,8 +162,7 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 
 > Netlify Functions（Node 运行时）同样是无服务器环境，**无法运行 Chromium**，行为与
 > Vercel 类似：走简化 token + 自动重试，稳定性有限。
-> 函数超时在 `netlify.toml` 中配置（同步函数上限：Pro/Enterprise 26s，免费 Hobby 10s）；
-> 流式(SSE)响应会被缓冲后整体返回。
+> 函数超时在 `netlify.toml` 中配置（上限由 Netlify 计划决定）；流式(SSE)响应会被缓冲后整体返回。
 
 ### Cloudflare Workers
 
