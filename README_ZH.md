@@ -14,6 +14,105 @@
 - 🎬📄 支持视频解析、图片与文档解析
 - 💬 内置 Web 聊天界面
 
+## 架构总览（运行全貌）
+
+所有部署形态共用同一套代码：每个平台入口（`index.js`、`api/index.js`、
+`netlify/functions/api.js`、`worker.js`）都只是薄协议适配层，调用同一个
+`core.js` 业务逻辑，因此路由、附件上传、流式、错误处理在各平台行为一致。
+
+```
+                     ┌──────────────────────────────────────┐
+                     │  客户端：OpenAI SDK / curl /          │
+                     │  内置 /chat 聊天页面                  │
+                     └──────────────────┬───────────────────┘
+                                        │  OpenAI 兼容 HTTP
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  入口适配层（薄包装：只做路由与平台协议适配）                              │
+│                                                                          │
+│   index.js              api/index.js       netlify/functions/api.js      │
+│   (Express,             (Vercel Node 函数,  (Netlify Node 函数,           │
+│    本地 / Docker)        maxDuration 60s)    timeout 26s / 10s)          │
+│   worker.js                                                              │
+│   (CF Worker, nodejs_compat)                                             │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  core.js —— 唯一的业务逻辑模块（esbuild 打包进每个入口）                    │
+│                                                                          │
+│   路由:   GET  /v1/models                 （模型列表，动态抓取上游）       │
+│           POST /v1/chat/completions       （对话，OpenAI 兼容）           │
+│           POST /v1/chat/completions/log   （对话+进度日志；               │
+│                                             视频分析专用端点）            │
+│           POST /v1/images/generations     （文生图）                      │
+│           GET  /chat                      （内置聊天页面）                │
+│           GET  /                          （健康检查）                    │
+│                                                                          │
+│   /chat 页面:  磁盘可读时读 chat.html（本地开发实时生效）                  │
+│                读不到时回退到打包进代码的 chat-html.js 内联副本            │
+│                （serverless 函数环境）；重新生成命令：                    │
+│                npm run build:chat-html                                   │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │  单次请求处理流水线
+                                    ▼
+   ①  鉴权     validateToken —— 环境变量 API_TOKENS（为空则开放访问）
+   ②  Token    getBaxiaTokens
+                 ├─ Node + Chromium → 真实 baxia SDK（T2gAv_ + cookies，缓存 25 分钟）
+                 └─ serverless / CF → 简化 token（wu.json），自动降级
+   ③  建会话   createChatSession —— /api/v2/chats/new，失败换 token 重试 3 次
+   ④  解析     消息 → 文本 + 附件（图片 / 音频 / 视频 / 文档）
+   ⑤  视频     [仅 /log 端点] body.video_url → yt-dlp 下载
+                 → 包装成普通 video 附件
+                 （仅本地/Docker；serverless 返回明确错误）
+   ⑥  上传     每个附件：取字节 → getstsToken → PUT 阿里云 OSS（V4 签名）
+                 → 状态轮询（视频跳过）→ 文档解析（仅文档）
+   ⑦  对话     POST /api/v2/chat/completions（上游 SSE 流，files=已上传）
+   ⑧  响应     stream=true  → 实时 SSE 映射（Express / Vercel / CF）
+                              或缓冲后整体返回（Netlify）
+               stream=false → 收集后返回非流式 JSON chat.completion
+```
+
+### 视频分析流程
+
+视频分析**复用通用对话端点**（`/v1/chat/completions/log`）+ 一个可选字段，
+不需要专用新接口。聊天页面填写视频链接后会自动切换到该端点。
+
+```
+POST /v1/chat/completions/log
+body: {
+  "messages": [...],
+  "stream": true,
+  "video_url": "https://...",      // 触发视频分析
+  "min_video_resolution": 480      // 可选，默认 480
+}
+
+  ①  yt-dlp 下载视频（清晰度：请求参数 → 环境变量 MIN_VIDEO_RESOLUTION → 480）
+  ②  视频包装成普通 'video' 附件
+  ③  与图片/文件走同一条 OSS 上传链（视频跳过状态轮询）
+  ④  携带上传文件发起普通对话
+```
+
+### 平台能力对比
+
+| 能力 | 本地 / Docker | Vercel | Netlify | CF Worker |
+|------|---------------|--------|---------|-----------|
+| 真实 baxia token（Chromium） | ✅ | ❌ 简化 | ❌ 简化 | ❌ 简化 |
+| 实时 SSE 流式 | ✅ | ✅ | ⚠️ 缓冲 | ✅ |
+| 视频分析（yt-dlp） | ✅ | ❌ | ❌ | ❌ |
+| 附件上传（OSS） | ✅ | ✅ 60s 限制 | ✅ 26s / 10s | ✅ 30s CPU |
+| 聊天页 /chat | ✅ 读文件 | ✅ 内联副本 | ✅ 内联副本 | ✅ 内联副本 |
+
+### 设计要点
+
+- **`nodeRequire(name)`** 动态加载 Node 内置模块：打包器不会把它内联，
+  因此同一份 `core.js` 也能在 CF Workers 上构建；运行时模块缺失时返回
+  `null`，调用方优雅降级（WebCrypto 代替 `crypto`、`wu.json` 代替 baxia SDK）。
+- **`process` 防护**——serverless 运行时可能完全没有 `process`，所有访问
+  都经过 `typeof process !== 'undefined'` 判断。
+- **`chat-html.js`** 由 `scripts/build-chat-html.js` 从 `chat.html` 生成
+  （`npm run build:chat-html`）——修改 `chat.html` 后需重新生成。
+
 ## 部署方式
 
 > 不同平台在**认证凭证获取**上有本质区别，直接影响对话稳定性，请先阅读
@@ -96,29 +195,15 @@ wrangler deploy
 | 视频链接 / 大文件分析 | ✅ 支持（需 yt-dlp） | ❌ 不支持（serverless 限制） |
 | 适用场景 | 自建服务器、日常使用 | 快速部署、轻量试用 |
 
-### Cloudflare Workers
-
-```bash
-# 安装 wrangler
-npm install -g wrangler
-
-# 登录
-wrangler login
-
-# 部署
-wrangler deploy
-```
-
-在 Cloudflare Dashboard 中设置环境变量 `API_TOKENS`。
-
 ## 公共服务
 
-提供两个公共服务供测试使用：
+提供三个公共服务供测试使用：
 
 | 服务地址 | 平台 |
 |----------|------|
 | `https://qwen2api-n.smanx.xx.kg` | Netlify |
 | ~~`https://qwen2api-v.smanx.xx.kg`~~ | ~~Vercel~~ （使用超额已停机） |
+| `https://qwen2api.smanx.xx.kg` | Cloudflare Workers |
 
 - 无需 API Token（密钥为空）
 - 建议自行部署以获得更稳定的服务
@@ -330,17 +415,20 @@ for await (const chunk of stream) {
 
 ```
 qwen2api/
-├── core.js              # 核心业务逻辑
-├── index.js             # Docker / 本地入口
+├── chat.html             # Web 聊天页源码（改这个文件）
+├── chat-html.js          # chat.html 的内联副本（npm run build:chat-html 生成）
+├── core.js               # 核心业务逻辑（所有平台共用）
+├── index.js              # Docker / 本地入口
 ├── api/
-│   └── index.js         # Vercel 入口（Node 运行时，复用 core.js）
+│   └── index.js          # Vercel 入口（Node 运行时，复用 core.js）
 ├── netlify/
 │   └── functions/
-│       └── api.js       # Netlify Functions（Node）入口
+│       └── api.js        # Netlify Functions（Node）入口
 ├── scripts/
-│   ├── baxia-token.js   # 用 Chromium 运行真实 baxia SDK 获取 token（本地/Docker 用）
-│   └── tampermonkey.js  # 浏览器脚本（可选）
-├── worker.js            # Cloudflare Workers 入口（复用 core.js）
+│   ├── baxia-token.js    # 用 Chromium 运行真实 baxia SDK 获取 token（本地/Docker 用）
+│   ├── build-chat-html.js # 从 chat.html 重新生成 chat-html.js
+│   └── tampermonkey.js   # 浏览器脚本（可选）
+├── worker.js             # Cloudflare Workers 入口（复用 core.js）
 ├── Dockerfile
 ├── vercel.json
 ├── netlify.toml
