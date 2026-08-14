@@ -45,8 +45,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 根据分支/标签/SHA 自动生成镜像标签，例如：
-      #   ghcr.io/smanx/qwen2api:latest      （默认分支）
+      # 每次构建都会默认打上 latest 标签；同时根据分支/标签/SHA 附带其他标签，例如：
+      #   ghcr.io/smanx/qwen2api:latest
       #   ghcr.io/smanx/qwen2api:master
       #   ghcr.io/smanx/qwen2api:<7位sha>
       #   ghcr.io/smanx/qwen2api:<semver>    （推送 v1.2.3 之类标签时）
@@ -56,11 +56,11 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=latest
             type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: 构建并推送镜像
         uses: docker/build-push-action@v6
