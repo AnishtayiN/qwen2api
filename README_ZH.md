@@ -151,8 +151,8 @@ docker pull ghcr.io/smanx/qwen2api:latest
 docker run -d -p 8765:7860 --shm-size=2g -e API_TOKENS=your_token ghcr.io/smanx/qwen2api:latest
 ```
 
-- 常用标签：`latest`（最新构建）、`master`（分支名）、`<7位sha>`（每次提交）、`vX.Y.Z`（版本标签）。
-- 想固定到某次提交：`docker pull ghcr.io/smanx/qwen2api:<sha>`。
+- 常用标签：`latest`（最新构建）、`master`（分支名）、`sha-<7位sha>`（每次提交）、`vX.Y.Z`（版本标签）。
+- 想固定到某次提交：`docker pull ghcr.io/smanx/qwen2api:sha-<7位sha>`。
 - 容器内端口为 `7860`，如要改宿主映射端口只需调整 `-p` 左侧（如 `-p 9000:7860`）。
 
 ### Vercel

@@ -166,8 +166,8 @@ docker pull ghcr.io/smanx/qwen2api:latest
 docker run -d -p 8765:7860 --shm-size=2g -e API_TOKENS=your_token ghcr.io/smanx/qwen2api:latest
 ```
 
-- Common tags: `latest` (newest build), `master` (branch), `<7-char sha>` (per commit), `vX.Y.Z` (release tags).
-- Pin a specific commit: `docker pull ghcr.io/smanx/qwen2api:<sha>`.
+- Common tags: `latest` (newest build), `master` (branch), `sha-<7-char sha>` (per commit), `vX.Y.Z` (release tags).
+- Pin a specific commit: `docker pull ghcr.io/smanx/qwen2api:sha-<7-char sha>`.
 - The container listens on port `7860`; change the left side of `-p` to remap the host port (e.g. `-p 9000:7860`).
 
 ### Hugging Face Spaces (Docker)

@@ -48,8 +48,10 @@ jobs:
       # 每次构建都会默认打上 latest 标签；同时根据分支/标签/SHA 附带其他标签，例如：
       #   ghcr.io/smanx/qwen2api:latest
       #   ghcr.io/smanx/qwen2api:master
-      #   ghcr.io/smanx/qwen2api:<7位sha>
+      #   ghcr.io/smanx/qwen2api:sha-<7位sha>
       #   ghcr.io/smanx/qwen2api:<semver>    （推送 v1.2.3 之类标签时）
+      # 说明：sha 标签带 sha- 前缀，让 latest 在 GitHub 包页面的
+      # 标签排序中排最前，页面默认展示 latest 而不是哈希 tag。
       - name: 生成镜像元数据（标签）
         id: meta
         uses: docker/metadata-action@v5
@@ -60,12 +62,14 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}
-            type=sha
+            type=sha,prefix=sha-
 
       - name: 构建并推送镜像
         uses: docker/build-push-action@v6
         with:
           context: .
+          # 同时构建 amd64 和 arm64（QEMU + Buildx 已在上方配置）
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
