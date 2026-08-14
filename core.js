@@ -1648,11 +1648,19 @@ let chatHtmlCache = null;
 function getChatHtml() {
   const fs = nodeRequire('fs');
   const path = nodeRequire('path');
-  if (!fs || !path) return ''; // 非 Node 环境（CF Workers）由入口自行提供聊天页
-  const htmlPath = path.join(__dirname, 'chat.html');
-  // 开发模式下每次都重新读取文件
-  chatHtmlCache = fs.readFileSync(htmlPath, 'utf-8');
-  return chatHtmlCache;
+  if (fs && path) {
+    try {
+      const htmlPath = path.join(__dirname, 'chat.html');
+      // 开发模式下每次都重新读取文件（本地/磁盘可读时以文件为准）
+      chatHtmlCache = fs.readFileSync(htmlPath, 'utf-8');
+      return chatHtmlCache;
+    } catch {
+      // 函数打包环境（Vercel/Netlify）读不到 chat.html，落到下方内联副本
+    }
+  }
+  // 兜底：chat-html.js 是构建脚本从 chat.html 生成的内联副本，
+  // esbuild 会把它静态打包进所有平台（本地、Vercel、Netlify、CF Workers）。
+  return require('./chat-html.js');
 }
 
 function handleChatPage() {

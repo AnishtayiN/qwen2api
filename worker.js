@@ -11,11 +11,10 @@
  * - core.js 中所有 Node 内置模块均通过 nodeRequire 动态加载，在 CF Worker 上
  *   自动降级（无 fs / child_process / Chromium / yt-dlp）。
  * - stream=true 时通过 TransformStream 实时转发上游 SSE，与本地 Express 行为一致。
- * - 聊天页 /chat 由 wrangler 将 chat.html 打包为文本导入（core.js 在 CF 上
- *   无法读取磁盘文件，故由本入口直接提供）。
+ * - 聊天页 /chat 由 core.js 提供：磁盘可读时读 chat.html，否则用打包进
+ *   chat-html.js 的内联副本（由 scripts/build-chat-html.js 生成）。
  */
 
-import chatHtml from './chat.html';
 import core from './core.js';
 
 const {
@@ -24,6 +23,7 @@ const {
   handleChatCompletionsWithLogs,
   handleImageGenerations,
   handleRoot,
+  handleChatPage,
   createExpressStreamHandler,
   createExpressLogStreamHandler,
 } = core;
@@ -143,9 +143,9 @@ export default {
       return toCfResponse(await handleImageGenerations(await readJson(request), authHeader, env));
     }
 
-    // GET /chat 聊天页面（chat.html 由 wrangler 打包为文本）
+    // GET /chat 聊天页面（由 core.js 提供，含内联副本兜底）
     if (request.method === 'GET' && (pathname === '/chat' || pathname === '/chat/')) {
-      return new Response(chatHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS } });
+      return toCfResponse(handleChatPage());
     }
 
     // GET / 根路径

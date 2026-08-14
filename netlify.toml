@@ -19,18 +19,17 @@
   status = 200
   force = true
 
-# /chat 页面直接由仓库根目录的 chat.html 静态文件提供
-# （函数环境读不到 chat.html，走函数会 ENOENT）
-# 注意：不能用 "/chat/*" 通配——它会连 /chat.html 自己也匹配上，造成重定向循环。
+# /chat 页面由函数提供（core.js 磁盘读取失败时会回退到打包进
+# chat-html.js 的内联副本，因此函数环境也能正常返回页面）
 [[redirects]]
   from = "/chat"
-  to = "/chat.html"
+  to = "/.netlify/functions/api/chat"
   status = 200
   force = true
 
 [[redirects]]
-  from = "/chat/"
-  to = "/chat.html"
+  from = "/chat/*"
+  to = "/.netlify/functions/api/chat/:splat"
   status = 200
   force = true
 
