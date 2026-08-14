@@ -138,6 +138,23 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 - 容器内通过 `CHROME_PATH=/usr/bin/chromium` 自动定位浏览器（见环境变量表）。
 - 若某些环境无法运行 Chromium，可用 `USE_CHROME_BAXIA=false` 回退到简化 token（稳定性下降）。
 
+#### 使用 GHCR 预构建镜像（免本地构建）
+
+每次代码推送或手动触发，GitHub Actions 都会自动构建镜像并推送到
+**GitHub Container Registry**（见 `.github/workflows/docker-build.yml`），可直接拉取使用：
+
+```bash
+# 拉取最新镜像
+docker pull ghcr.io/smanx/qwen2api:latest
+
+# 运行（容器内监听 7860，映射到宿主 8765；Chromium 需要足够共享内存，务必加 --shm-size）
+docker run -d -p 8765:7860 --shm-size=2g -e API_TOKENS=your_token ghcr.io/smanx/qwen2api:latest
+```
+
+- 常用标签：`latest`（最新构建）、`master`（分支名）、`<7位sha>`（每次提交）、`vX.Y.Z`（版本标签）。
+- 想固定到某次提交：`docker pull ghcr.io/smanx/qwen2api:<sha>`。
+- 容器内端口为 `7860`，如要改宿主映射端口只需调整 `-p` 左侧（如 `-p 9000:7860`）。
+
 ### Vercel
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/smanx/qwen2api)

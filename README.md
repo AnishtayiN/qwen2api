@@ -152,6 +152,24 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 - If Chromium cannot run in your environment, set `USE_CHROME_BAXIA=false` to fall
   back to the simplified token (less stable).
 
+#### Using the pre-built GHCR image (no local build)
+
+Every push or manual trigger runs a GitHub Actions workflow that builds the image
+and pushes it to **GitHub Container Registry** (see `.github/workflows/docker-build.yml`).
+Pull and run it directly:
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/smanx/qwen2api:latest
+
+# Run (container listens on 7860, mapped to host 8765; Chromium needs shared memory -- always add --shm-size)
+docker run -d -p 8765:7860 --shm-size=2g -e API_TOKENS=your_token ghcr.io/smanx/qwen2api:latest
+```
+
+- Common tags: `latest` (newest build), `master` (branch), `<7-char sha>` (per commit), `vX.Y.Z` (release tags).
+- Pin a specific commit: `docker pull ghcr.io/smanx/qwen2api:<sha>`.
+- The container listens on port `7860`; change the left side of `-p` to remap the host port (e.g. `-p 9000:7860`).
+
 ### Hugging Face Spaces (Docker)
 
 1. Create a new **Docker** Space on Hugging Face.
