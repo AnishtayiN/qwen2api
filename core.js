@@ -247,7 +247,12 @@ async function createChatSession(actualModel, chatType, retries = 3) {
 // ============================================
 
 function getApiTokens(env) {
-  const tokens = env?.API_TOKENS || process?.env?.API_TOKENS;
+  // 注意：不能用 process?.env 直接访问——在 CF Workers 等无 process 的环境里，
+  // 未声明的标识符会直接抛 ReferenceError（可选链救不了未声明变量）。
+  let tokens = env?.API_TOKENS;
+  if (!tokens && typeof process !== 'undefined' && process?.env) {
+    tokens = process.env.API_TOKENS;
+  }
   if (!tokens) return [];
   return tokens.split(',').map(t => t.trim()).filter(t => t);
 }
@@ -1521,7 +1526,7 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   const actualModel = model || 'qwen3.8-max';
 
   // 检查是否启用搜索
-  const enableSearch = (env?.ENABLE_SEARCH || process?.env?.ENABLE_SEARCH || '').toLowerCase() === 'true';
+  const enableSearch = (env?.ENABLE_SEARCH || (typeof process !== 'undefined' && process.env && process.env.ENABLE_SEARCH) || '').toLowerCase() === 'true';
   const chatType = enableSearch ? 'search' : 't2t';
   logChatDetail('core', 'request.config', { actualModel, chatType, enableSearch });
 
@@ -2120,7 +2125,7 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
   const actualModel = model || 'qwen3.8-max';
 
   // 检查是否启用搜索
-  const enableSearch = (env?.ENABLE_SEARCH || process?.env?.ENABLE_SEARCH || '').toLowerCase() === 'true';
+  const enableSearch = (env?.ENABLE_SEARCH || (typeof process !== 'undefined' && process.env && process.env.ENABLE_SEARCH) || '').toLowerCase() === 'true';
   const chatType = enableSearch ? 'search' : 't2t';
   logChatDetail('core', 'request.config', { actualModel, chatType, enableSearch });
   sendLog('config.ready', { model: actualModel, chatType, enableSearch });
