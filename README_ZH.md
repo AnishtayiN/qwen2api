@@ -9,7 +9,7 @@
 - 🔄 OpenAI API 兼容格式
 - 🚀 支持流式响应 (SSE)
 - 🔐 可选的 API Token 认证
-- 🌐 多平台部署支持
+- 🌐 多平台部署：本地 NodeJS / Docker、Vercel、Netlify、Cloudflare Workers
 - 🖼️ 支持图片生成
 - 🎬📄 支持视频解析、图片与文档解析
 - 💬 内置 Web 聊天界面

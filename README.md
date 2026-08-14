@@ -18,7 +18,7 @@ A proxy service that converts Qwen Chat to an OpenAI-compatible API.
 - 🔄 OpenAI API compatible format
 - 🚀 Streaming response support (SSE)
 - 🔐 Optional API Token authentication
-- 🌐 Multi-platform deployment support
+- 🌐 Multi-platform deployment: Local NodeJS / Docker, Vercel, Netlify, Cloudflare Workers
 - 🖼️ Image generation support
 - 🎬📄 Video analysis, image and document parsing support
 - 💬 Built-in web chat interface
