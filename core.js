@@ -1485,7 +1485,7 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
     return createResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
   }
 
-  const { model, messages, stream = true, tools } = body;
+  const { model, messages, stream = false, tools } = body;
   if (!messages?.length) {
     logChatDetail('core', 'request.validation.failed', { reason: 'Messages are required' });
     return createResponse({ error: { message: 'Messages are required', type: 'invalid_request_error' } }, 400);
@@ -2066,7 +2066,7 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
     return createResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
   }
 
-  const { model, messages, stream = true, tools } = body;
+  const { model, messages, stream = false, tools } = body;
   if (!messages?.length) {
     logChatDetail('core', 'request.validation.failed', { reason: 'Messages are required' });
     return createResponse({ error: { message: 'Messages are required', type: 'invalid_request_error' } }, 400);

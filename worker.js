@@ -864,7 +864,7 @@ async function handleChatCompletions(body, authHeader, env) {
     return jsonResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
   }
 
-  const { model, messages, stream = true, tools } = body;
+  const { model, messages, stream = false, tools } = body;
   if (!messages?.length) {
     logChatDetail('cloudflare-worker', 'request.validation.failed', { reason: 'Messages are required' });
     return jsonResponse({ error: { message: 'Messages are required', type: 'invalid_request_error' } }, 400);

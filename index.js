@@ -509,6 +509,10 @@ function startExpressServer() {
           const parsed = typeof result.body === 'string' ? JSON.parse(result.body) : result.body;
           if (parsed && parsed.error) {
             payload = parsed;
+          } else if (result.statusCode >= 200 && result.statusCode < 300 && parsed) {
+            // 非流式成功响应（stream 未传或为 false）：日志事件已开始 SSE，
+            // 将完整 completion 作为 data 事件输出，保证内容仍能送达。
+            payload = parsed;
           }
         } catch {}
         res.write(`data: ${JSON.stringify(payload)}\n\n`);

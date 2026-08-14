@@ -3020,7 +3020,7 @@ async function handleChatCompletions(body, authHeader, env) {
     return jsonResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
   }
 
-  const { model, messages, stream = true } = body;
+  const { model, messages, stream = false } = body;
   if (!messages?.length) {
     logChatDetail('netlify-edge', 'request.validation.failed', { reason: 'Messages are required' });
     return jsonResponse({ error: { message: 'Messages are required', type: 'invalid_request_error' } }, 400);
