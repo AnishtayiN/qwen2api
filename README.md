@@ -67,6 +67,10 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 > Vercel is a serverless platform and **cannot run Chromium**, so it only uses
 > the simplified token path. It may be intermittently blocked by upstream risk
 > control; stability is lower than local/Docker.
+> The Vercel entry (`api/index.js`) uses the **Node.js runtime** and shares the
+> same `core.js` logic as local/Docker and Netlify. Function timeout is set via
+> `module.exports.config.maxDuration` (60s on Hobby, higher on Pro); SSE streaming
+> is forwarded in real time (Vercel Node functions support streaming).
 
 ### Netlify
 
@@ -76,8 +80,10 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 2. Import the project in Netlify
 3. Optional: Set environment variable `API_TOKENS`
 
-> Netlify Edge Functions are also serverless and **cannot run Chromium**, so
-> behavior is similar to Vercel: simplified token + automatic retry, limited stability.
+> Netlify Functions (Node runtime) are also serverless and **cannot run Chromium**,
+> so behavior is similar to Vercel: simplified token + automatic retry, limited stability.
+> The function timeout is configured in `netlify.toml` (max 26s on Pro/Enterprise,
+> 10s on the free Hobby plan); streaming responses are buffered and returned whole.
 
 ### Cloudflare Workers
 
@@ -96,6 +102,10 @@ Set the environment variable `API_TOKENS` in the Cloudflare Dashboard.
 
 > Cloudflare Workers are also serverless and cannot run Chromium; only the
 > simplified token is available.
+> The Worker entry (`worker.js`) is a thin wrapper that reuses the same `core.js`
+> logic as local/Docker, Vercel and Netlify (requires the `nodejs_compat`
+> compatibility flag, already set in `wrangler.toml`). SSE streaming is forwarded
+> in real time. Video URL analysis / yt-dlp are not supported on Workers.
 
 ### Platform Comparison
 
@@ -328,14 +338,14 @@ qwen2api/
 ├── core.js              # Core business logic
 ├── index.js             # Docker / Local entry point
 ├── api/
-│   └── index.js         # Vercel entry point
+│   └── index.js         # Vercel entry point (Node runtime, reuses core.js)
 ├── netlify/
-│   └── edge-functions/
-│       └── api.js       # Netlify entry point
+│   └── functions/
+│       └── api.js       # Netlify Functions (Node) entry point
 ├── scripts/
 │   ├── baxia-token.js   # Get token via real baxia SDK using Chromium (local/Docker)
 │   └── tampermonkey.js  # Optional browser script
-├── worker.js            # Cloudflare Workers entry point
+├── worker.js            # Cloudflare Workers entry point (reuses core.js)
 ├── Dockerfile
 ├── vercel.json
 ├── netlify.toml

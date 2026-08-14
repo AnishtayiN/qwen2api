@@ -28,6 +28,23 @@ let tokenCache = null;
 let tokenCacheTime = 0;
 
 // ============================================
+// 跨平台 require 助手
+// ============================================
+
+// 动态加载 Node 内置模块：Node 环境正常返回模块；无 require 的环境
+// （Cloudflare Workers 等）返回 null，由调用方优雅降级。
+// 注意：必须通过本函数间接 require，避免 esbuild 静态打包 Node 内置模块
+// 导致 CF Worker 构建失败。
+function nodeRequire(name) {
+  if (typeof require !== 'function') return null;
+  try {
+    return require(name);
+  } catch {
+    return null;
+  }
+}
+
+// ============================================
 // Baxia Token 生成
 // ============================================
 
@@ -42,22 +59,22 @@ function randomString(length) {
 }
 
 function cryptoRandomBytes(length) {
-  // Node.js 环境 (包括 Vercel/Netlify)
-  if (typeof process !== 'undefined' && process.versions && process.versions.node) {
-    return require('crypto').randomBytes(length);
+  // Node 环境优先用 crypto.randomBytes；其他环境回退 WebCrypto
+  const nodeCrypto = nodeRequire('crypto');
+  if (nodeCrypto && typeof nodeCrypto.randomBytes === 'function') {
+    return nodeCrypto.randomBytes(length);
   }
-  // Cloudflare Workers / 浏览器
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);
   return bytes;
 }
 
 function cryptoHash(data) {
-  // Node.js 环境 (包括 Vercel/Netlify)
-  if (typeof process !== 'undefined' && process.versions && process.versions.node) {
-    return require('crypto').createHash('md5').update(data).digest('base64').substring(0, 32);
+  // Node 环境用 MD5；其他环境（CF Workers / 浏览器）返回随机字符串
+  const nodeCrypto = nodeRequire('crypto');
+  if (nodeCrypto && typeof nodeCrypto.createHash === 'function') {
+    return nodeCrypto.createHash('md5').update(data).digest('base64').substring(0, 32);
   }
-  // Cloudflare Workers / 浏览器 - 返回随机字符串
   return randomString(32);
 }
 
@@ -111,18 +128,24 @@ async function getBaxiaTokens(forceRefresh) {
   }
 
   // 优先用真实 baxia SDK（系统 Chrome 无头模式生成有效 token）。
-  // 仅在本地 Node 环境可用；serverless 无 Chrome 时自动回退 wu.json。
-  if (process.env.USE_CHROME_BAXIA !== 'false' && typeof process.versions.node === 'string') {
+  // 仅在本地 Node 环境可用；serverless / CF Workers 无 Chrome 时自动回退 wu.json。
+  const isNodeRuntime = typeof process !== 'undefined' && process.versions && typeof process.versions.node === 'string';
+  const chromeEnabled = isNodeRuntime && (!process.env || process.env.USE_CHROME_BAXIA !== 'false');
+  if (chromeEnabled) {
     try {
-      const { getBaxiaTokens: getChromeTokens } = require('./scripts/baxia-token.js');
-      const t = await getChromeTokens();
-      if (t && t.bxUmidToken && /^T2gA/i.test(t.bxUmidToken)) {
-        const result = { bxUa: t.bxUa, bxUmidToken: t.bxUmidToken, bxV: t.bxV || '2.5.37', cookies: t.cookies || '' };
-        tokenCache = result;
-        tokenCacheTime = now;
-        return result;
+      const baxiaMod = nodeRequire('./scripts/baxia-token.js');
+      if (baxiaMod && typeof baxiaMod.getBaxiaTokens === 'function') {
+        const t = await baxiaMod.getBaxiaTokens();
+        if (t && t.bxUmidToken && /^T2gA/i.test(t.bxUmidToken)) {
+          const result = { bxUa: t.bxUa, bxUmidToken: t.bxUmidToken, bxV: t.bxV || '2.5.37', cookies: t.cookies || '' };
+          tokenCache = result;
+          tokenCacheTime = now;
+          return result;
+        } else {
+          console.log('[qwen2api][baxia] Chrome branch returned invalid token, fallback');
+        }
       } else {
-        console.log('[qwen2api][baxia] Chrome branch returned invalid token, fallback');
+        console.log('[qwen2api][baxia] baxia SDK unavailable in this runtime, fallback');
       }
     } catch (e) {
       console.log('[qwen2api][baxia] Chrome branch failed:', e.message);
@@ -694,8 +717,7 @@ async function fetchImageAsBase64(url) {
     throw new Error(`Failed to fetch image: HTTP ${resp.status}`);
   }
   const arrayBuffer = await resp.arrayBuffer();
-  const bytes = Buffer.from(arrayBuffer);
-  return bytes.toString('base64');
+  return bytesToBase64(new Uint8Array(arrayBuffer));
 }
 
 function decodeUtf8(bytes) {
@@ -949,11 +971,9 @@ function getWebCrypto() {
   if (globalThis.crypto && globalThis.crypto.subtle) {
     return globalThis.crypto;
   }
-  if (typeof require === 'function') {
-    const nodeCrypto = require('crypto');
-    if (nodeCrypto.webcrypto && nodeCrypto.webcrypto.subtle) {
-      return nodeCrypto.webcrypto;
-    }
+  const nodeCrypto = nodeRequire('crypto');
+  if (nodeCrypto && nodeCrypto.webcrypto && nodeCrypto.webcrypto.subtle) {
+    return nodeCrypto.webcrypto;
   }
   throw new Error('WebCrypto is not available');
 }
@@ -1621,8 +1641,9 @@ function handleRoot() {
 let chatHtmlCache = null;
 
 function getChatHtml() {
-  const fs = require('fs');
-  const path = require('path');
+  const fs = nodeRequire('fs');
+  const path = nodeRequire('path');
+  if (!fs || !path) return ''; // 非 Node 环境（CF Workers）由入口自行提供聊天页
   const htmlPath = path.join(__dirname, 'chat.html');
   // 开发模式下每次都重新读取文件
   chatHtmlCache = fs.readFileSync(htmlPath, 'utf-8');
@@ -1673,8 +1694,9 @@ function resolveYtDlpAsset(platform, arch) {
 }
 
 function canRunYtDlp(binaryPath) {
-  const { spawnSync } = require('child_process');
-  const result = spawnSync(binaryPath, ['--version'], {
+  const childProcess = nodeRequire('child_process');
+  if (!childProcess || typeof childProcess.spawnSync !== 'function') return false;
+  const result = childProcess.spawnSync(binaryPath, ['--version'], {
     stdio: 'ignore',
     shell: false,
   });
@@ -1682,9 +1704,12 @@ function canRunYtDlp(binaryPath) {
 }
 
 async function ensureYtDlpAvailable(sendLog) {
-  const fs = require('fs');
-  const path = require('path');
-  const os = require('os');
+  const fs = nodeRequire('fs');
+  const path = nodeRequire('path');
+  const os = nodeRequire('os');
+  if (!fs || !path || !os) {
+    throw new Error('yt-dlp is not supported in this runtime (no filesystem)');
+  }
   const log = typeof sendLog === 'function' ? sendLog : () => {};
   const platform = process.platform;
   const arch = process.arch;
@@ -1806,10 +1831,14 @@ function getEffectiveMinResolution(preferredResolution) {
 }
 
 async function downloadVideoWithYtDlp(videoUrl, sendLog, preferredResolution) {
-  const { spawn } = require('child_process');
-  const path = require('path');
-  const fs = require('fs');
-  const os = require('os');
+  const childProcess = nodeRequire('child_process');
+  const path = nodeRequire('path');
+  const fs = nodeRequire('fs');
+  const os = nodeRequire('os');
+  if (!childProcess || !path || !fs || !os) {
+    throw new Error('yt-dlp is not supported in this runtime (no child_process/filesystem)');
+  }
+  const { spawn } = childProcess;
 
   // 从环境变量获取最低分辨率，默认 480p
   const resolutionInfo = getEffectiveMinResolution(preferredResolution);
@@ -2236,7 +2265,8 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
 
   // 清理临时视频文件的函数
   const cleanupTempFiles = () => {
-    const fs = require('fs');
+    const fs = nodeRequire('fs');
+    if (!fs) return;
     for (const tempFile of tempFilesToClean) {
       try {
         if (fs.existsSync(tempFile)) {
@@ -2302,6 +2332,184 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
 }
 
 // ============================================
+// 流式响应写入器（Express / Vercel Node 共用）
+// ============================================
+
+// 通用 SSE 流写入器：把上游 SSE 实时转成 OpenAI 格式并写入 res
+// （res 只需支持 setHeader / write / end / writableEnded，Express 与 Vercel Node 均满足）
+function createExpressStreamHandler(res) {
+  return async (response, model, responseId, created) => {
+    const rawFlag = (typeof process !== 'undefined' && process.env && process.env.CHAT_DETAIL_LOG) || '';
+    const debugEnabled = ['1', 'true', 'yes', 'on'].includes(String(rawFlag).toLowerCase());
+    let hasStreamContent = false;
+
+    const writeStreamContent = (content) => {
+      if (!debugEnabled || !content) return;
+      hasStreamContent = true;
+      if (typeof process !== 'undefined' && process.stdout) process.stdout.write(content);
+    };
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+
+    const reader = response.body?.getReader ? response.body.getReader() : null;
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let doneWritten = false;
+    let anyChunkWritten = false;
+    let nonDataBuffer = '';
+
+    try {
+      if (!reader) {
+        throw new Error('Upstream response has no readable body');
+      }
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trimStart();
+          if (!trimmed.startsWith('data:')) {
+            nonDataBuffer += line + '\n';
+            continue;
+          }
+          const data = trimmed.slice(5).trim();
+          if (data === '[DONE]') {
+            res.write('data: [DONE]\n\n');
+            doneWritten = true;
+            continue;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed?.error) {
+              const upstreamError = typeof parsed.error === 'string' ? { message: parsed.error } : parsed.error;
+              const errorMsg = upstreamError.message || upstreamError.details || '请求失败';
+              // 内容安全警告作为正常输出而不是错误
+              if (upstreamError.code === 'data_inspection_failed' || upstreamError.details) {
+                const warningChunk = {
+                  id: responseId,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model,
+                  choices: [{
+                    index: 0,
+                    delta: { role: 'assistant', content: errorMsg },
+                    finish_reason: 'stop',
+                  }],
+                };
+                res.write(`data: ${JSON.stringify(warningChunk)}\n\n`);
+                doneWritten = true;
+                res.write('data: [DONE]\n\n');
+                continue;
+              }
+              const errObj = {
+                error: {
+                  message: errorMsg,
+                  type: upstreamError.type || 'api_error',
+                  code: upstreamError.code,
+                }
+              };
+              res.write(`data: ${JSON.stringify(errObj)}\n\n`);
+              anyChunkWritten = true;
+              continue;
+            }
+
+            const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
+            if (delta || parsed?.choices?.[0]?.finish_reason) {
+              if (delta && typeof delta.content === 'string' && delta.content) {
+                writeStreamContent(delta.content);
+              }
+              const chunk = {
+                id: responseId,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{
+                  index: 0,
+                  delta: delta || {},
+                  finish_reason: parsed?.choices?.[0]?.finish_reason || null,
+                }],
+              };
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              anyChunkWritten = true;
+            }
+          } catch {}
+        }
+      }
+      if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
+        nonDataBuffer += buffer;
+      }
+      if (!doneWritten && !anyChunkWritten) {
+        const err = tryParseUpstreamErrorPayload(nonDataBuffer);
+        if (err) {
+          res.write(`data: ${JSON.stringify({ error: err })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          doneWritten = true;
+        }
+      }
+    } catch (err) {
+      if (!res.writableEnded) {
+        const message = err && err.message ? err.message : 'stream proxy error';
+        res.write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
+      }
+    } finally {
+      if (!doneWritten && !res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+      }
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }
+
+    if (debugEnabled && hasStreamContent && typeof process !== 'undefined' && process.stdout) {
+      process.stdout.write('\n');
+      console.log('[qwen2api][stream] 输出完毕');
+    }
+  };
+}
+
+// 带日志事件（event: log）的流式写入器
+function createExpressLogStreamHandler(res) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+
+  const streamWriter = {
+    write: (data) => {
+      if (!res.writableEnded) {
+        res.write(data);
+      }
+    },
+    log: (logData) => {
+      if (!res.writableEnded) {
+        res.write(`event: log\n`);
+        res.write(`data: ${logData}\n\n`);
+      }
+    },
+    end: () => {
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }
+  };
+
+  return streamWriter;
+}
+
+// ============================================
 // 导出
 // ============================================
 
@@ -2319,5 +2527,7 @@ module.exports = {
   parseQwenSsePayload,
   mapUsageToOpenAI,
   tryParseUpstreamErrorPayload,
+  createExpressStreamHandler,
+  createExpressLogStreamHandler,
   uuidv4,
 };

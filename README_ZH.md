@@ -49,6 +49,9 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 
 > Vercel 是无服务器（serverless）环境，**无法运行 Chromium**，因此只能使用
 > 简化的 token 获取方式。可能间歇性被上游风控，稳定性不如本地/Docker。
+> Vercel 入口（`api/index.js`）使用 **Node.js 运行时**，与本地 / Netlify 共用
+> 同一套 `core.js` 逻辑。函数超时通过 `module.exports.config.maxDuration` 配置
+> （Hobby 上限 60s，Pro 可更高）；SSE 流式响应实时转发（Vercel Node 函数支持流式）。
 
 ### Netlify
 
@@ -58,8 +61,10 @@ docker run -d -p 8765:8765 --shm-size=2g -e API_TOKENS=your_token qwen2api
 2. 在 Netlify 中导入项目
 3. 可选：设置环境变量 `API_TOKENS`
 
-> Netlify Edge Function 同样是无服务器环境，**无法运行 Chromium**，行为与
+> Netlify Functions（Node 运行时）同样是无服务器环境，**无法运行 Chromium**，行为与
 > Vercel 类似：走简化 token + 自动重试，稳定性有限。
+> 函数超时在 `netlify.toml` 中配置（同步函数上限：Pro/Enterprise 26s，免费 Hobby 10s）；
+> 流式(SSE)响应会被缓冲后整体返回。
 
 ### Cloudflare Workers
 
@@ -77,6 +82,9 @@ wrangler deploy
 在 Cloudflare Dashboard 中设置环境变量 `API_TOKENS`。
 
 > Cloudflare Workers 同样是无服务器环境，无法运行 Chromium，只能使用简化 token。
+> Worker 入口（`worker.js`）是薄包装，复用与本地 / Vercel / Netlify 相同的 `core.js`
+> 逻辑（依赖 `wrangler.toml` 中已配置的 `nodejs_compat` 标志）。SSE 流式输出实时转发；
+> 视频链接分析（yt-dlp）在 Workers 上不支持。
 
 ### 平台差异对比
 
@@ -325,14 +333,14 @@ qwen2api/
 ├── core.js              # 核心业务逻辑
 ├── index.js             # Docker / 本地入口
 ├── api/
-│   └── index.js         # Vercel 入口
+│   └── index.js         # Vercel 入口（Node 运行时，复用 core.js）
 ├── netlify/
-│   └── edge-functions/
-│       └── api.js       # Netlify 入口
+│   └── functions/
+│       └── api.js       # Netlify Functions（Node）入口
 ├── scripts/
 │   ├── baxia-token.js   # 用 Chromium 运行真实 baxia SDK 获取 token（本地/Docker 用）
 │   └── tampermonkey.js  # 浏览器脚本（可选）
-├── worker.js            # Cloudflare Workers 入口
+├── worker.js            # Cloudflare Workers 入口（复用 core.js）
 ├── Dockerfile
 ├── vercel.json
 ├── netlify.toml
